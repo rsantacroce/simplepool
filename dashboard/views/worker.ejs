@@ -1,0 +1,91 @@
+<%
+const fmtN = (n) => new Intl.NumberFormat('en-US').format(n || 0);
+const fmtTs = (t) => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
+const ago = (t) => {
+    if (!t) return '—';
+    const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+};
+
+// SVG sparkline for the hashrate buckets.
+const W = 800, H = 120, PAD = 4;
+const vals = buckets.map(b => b.hashrate);
+const maxV = Math.max(1, ...vals);
+const n = vals.length;
+let pathD = '';
+if (n > 1) {
+    pathD = vals.map((v, i) => {
+        const x = PAD + (i / (n - 1)) * (W - 2 * PAD);
+        const y = H - PAD - (v / maxV) * (H - 2 * PAD);
+        return (i === 0 ? 'M' : 'L') + x.toFixed(2) + ' ' + y.toFixed(2);
+    }).join(' ');
+}
+%>
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="15">
+    <title><%= name %> · simplepool</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header class="top">
+        <a href="/" class="brand">simplepool</a>
+        <span class="tag">worker</span>
+    </header>
+    <main class="wrap">
+        <section class="card">
+            <h2><%= worker.name %></h2>
+            <div class="grid">
+                <div><label>Hashrate (24h)</label><strong><%= fmtHashrate(worker.window_hashrate) %></strong></div>
+                <div><label>Shares (24h)</label><strong><%= fmtN(worker.window_shares) %></strong></div>
+                <div><label>First seen</label><strong title="<%= fmtTs(worker.first_seen) %>"><%= ago(worker.first_seen) %></strong></div>
+                <div><label>Last seen</label><strong title="<%= fmtTs(worker.last_seen) %>"><%= ago(worker.last_seen) %></strong></div>
+                <div><label>Balance</label><strong class="muted">N/A</strong></div>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Hashrate · 10-min buckets · last 24h</h2>
+            <% if (n > 1) { %>
+                <svg class="spark" viewBox="0 0 <%= W %> <%= H %>" preserveAspectRatio="none">
+                    <path d="<%= pathD %>" fill="none" stroke="#7ad" stroke-width="1.5"/>
+                </svg>
+                <div class="muted small">peak: <%= fmtHashrate(maxV) %></div>
+            <% } else { %>
+                <p class="muted">Not enough data for a chart yet.</p>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>Recent shares</h2>
+            <% if (shares.length === 0) { %>
+                <p class="muted">No shares recorded.</p>
+            <% } else { %>
+            <table class="lb">
+                <thead><tr><th>When</th><th>Difficulty</th><th>Block?</th><th>Hash</th></tr></thead>
+                <tbody>
+                <% shares.forEach(s => { %>
+                    <tr<% if (s.is_block) { %> class="block"<% } %>>
+                        <td title="<%= fmtTs(s.ts) %>"><%= ago(s.ts) %></td>
+                        <td><%= fmtN(s.difficulty) %></td>
+                        <td><%= s.is_block ? 'BLOCK' : '' %></td>
+                        <td class="mono small"><%= s.block_hash || '' %></td>
+                    </tr>
+                <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+
+        <p><a href="/">← back to overview</a></p>
+    </main>
+    <footer class="foot"><span>read-only · auto-refresh 15s</span></footer>
+    <script src="/static/script.js" defer></script>
+</body>
+</html>

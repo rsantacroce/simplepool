@@ -1,0 +1,260 @@
+/* Standalone test for src/store.c. Builds with -lsqlite3 -lpthread. */
+
+#include "store.h"
+#include "log.h"
+
+#include <sqlite3.h>
+
+#include <assert.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static char g_db_paths[8][256];
+static int  g_db_count = 0;
+
+static const char *fresh_db_path(void) {
+    char *p = g_db_paths[g_db_count++];
+    snprintf(p, 256, "/tmp/store_test_%d_%d.db", (int)getpid(), g_db_count);
+    unlink(p);
+    /* WAL/SHM siblings */
+    char wal[300], shm[300];
+    snprintf(wal, sizeof(wal), "%s-wal", p);
+    snprintf(shm, sizeof(shm), "%s-shm", p);
+    unlink(wal);
+    unlink(shm);
+    return p;
+}
+
+static void cleanup_dbs(void) {
+    for (int i = 0; i < g_db_count; ++i) {
+        unlink(g_db_paths[i]);
+        char wal[300], shm[300];
+        snprintf(wal, sizeof(wal), "%s-wal", g_db_paths[i]);
+        snprintf(shm, sizeof(shm), "%s-shm", g_db_paths[i]);
+        unlink(wal);
+        unlink(shm);
+    }
+}
+
+static int64_t scalar_i64(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(st);
+    assert(rc == SQLITE_ROW);
+    int64_t v = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return v;
+}
+
+static double scalar_dbl(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(st);
+    assert(rc == SQLITE_ROW);
+    double v = sqlite3_column_double(st, 0);
+    sqlite3_finalize(st);
+    return v;
+}
+
+static void test_basic(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    int rc = store_open(&cfg, &s);
+    assert(rc == 0);
+    assert(s != NULL);
+
+    double expected_sum = 0.0;
+    for (int i = 0; i < 1000; ++i) {
+        char wname[32];
+        snprintf(wname, sizeof(wname), "worker%d", i % 10);
+        double diff = 1.0 + (double)(i % 7);
+        expected_sum += diff;
+        rc = store_record_share(s, wname, 1000ULL + (uint64_t)i, diff, 0, NULL);
+        assert(rc == 0);
+    }
+
+    rc = store_flush(s);
+    assert(rc == 0);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    assert(rc == SQLITE_OK);
+
+    int64_t nworkers = scalar_i64(db, "SELECT count(*) FROM workers");
+    int64_t nshares  = scalar_i64(db, "SELECT count(*) FROM shares");
+    double  sumd     = scalar_dbl(db, "SELECT sum(difficulty) FROM shares");
+    assert(nworkers == 10);
+    assert(nshares == 1000);
+    assert(sumd > expected_sum - 0.001 && sumd < expected_sum + 0.001);
+
+    /* Block path */
+    rc = store_record_block(s, 9999, 12345, "abc123hash", "worker3",
+                            "bcrt1qexampleaddr", 4950000000LL, 50000000LL);
+    assert(rc == 0);
+    rc = store_flush(s);
+    assert(rc == 0);
+
+    int64_t nblocks = scalar_i64(db, "SELECT count(*) FROM blocks_found");
+    assert(nblocks == 1);
+
+    sqlite3_stmt *st = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT b.finder_id, w.id, b.finder_address, b.reward_sats, b.fee_sats "
+        "FROM blocks_found b JOIN workers w ON w.name='worker3' LIMIT 1",
+        -1, &st, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(st);
+    assert(rc == SQLITE_ROW);
+    int64_t finder = sqlite3_column_int64(st, 0);
+    int64_t wid    = sqlite3_column_int64(st, 1);
+    const unsigned char *addr_txt = sqlite3_column_text(st, 2);
+    int64_t reward = sqlite3_column_int64(st, 3);
+    int64_t fee    = sqlite3_column_int64(st, 4);
+    assert(finder == wid);
+    assert(addr_txt && strcmp((const char *)addr_txt, "bcrt1qexampleaddr") == 0);
+    assert(reward == 4950000000LL);
+    assert(fee == 50000000LL);
+    sqlite3_finalize(st);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_basic\n");
+}
+
+static void test_rejects(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+
+    store_t *s = NULL;
+    int rc = store_open(&cfg, &s);
+    assert(rc == 0);
+
+    for (int i = 0; i < 50; ++i) {
+        char wname[32];
+        snprintf(wname, sizeof(wname), "rw%d", i);
+        rc = store_record_reject(s, wname, 1000 + (uint64_t)i, "low-difficulty");
+        assert(rc == 0);
+    }
+    rc = store_flush(s);
+    assert(rc == 0);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    assert(rc == SQLITE_OK);
+    int64_t n = scalar_i64(db, "SELECT count(*) FROM rejects");
+    assert(n == 50);
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_rejects\n");
+}
+
+typedef struct {
+    store_t *s;
+    int      tid;
+    int      n;
+} thread_arg_t;
+
+static void *thread_fn(void *arg) {
+    thread_arg_t *t = (thread_arg_t *)arg;
+    for (int i = 0; i < t->n; ++i) {
+        char wname[32];
+        snprintf(wname, sizeof(wname), "tw%d", t->tid);
+        int rc = store_record_share(t->s, wname,
+            10000ULL + (uint64_t)i, 2.5, 0, NULL);
+        if (rc != 0) {
+            /* retry briefly if queue saturated */
+            usleep(100);
+            --i;
+        }
+    }
+    return NULL;
+}
+
+static void test_concurrent(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 10;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    int rc = store_open(&cfg, &s);
+    assert(rc == 0);
+
+    pthread_t th[8];
+    thread_arg_t args[8];
+    for (int i = 0; i < 8; ++i) {
+        args[i].s = s; args[i].tid = i; args[i].n = 1000;
+        pthread_create(&th[i], NULL, thread_fn, &args[i]);
+    }
+    for (int i = 0; i < 8; ++i) pthread_join(th[i], NULL);
+
+    rc = store_flush(s);
+    assert(rc == 0);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    assert(rc == SQLITE_OK);
+    int64_t n = scalar_i64(db, "SELECT count(*) FROM shares");
+    assert(n == 8000);
+    int64_t nw = scalar_i64(db, "SELECT count(*) FROM workers");
+    assert(nw == 8);
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_concurrent (8000 shares across 8 threads)\n");
+}
+
+static void test_drop(void) {
+    /* Tiny ring; throw way more than can fit. */
+    store_test_set_ring_capacity(64);
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 1000;   /* writer rarely wakes */
+    cfg.commit_max_shares = 8;
+
+    store_t *s = NULL;
+    int rc = store_open(&cfg, &s);
+    assert(rc == 0);
+
+    int dropped_observed = 0;
+    for (int i = 0; i < 200000; ++i) {
+        rc = store_record_share(s, "ww", 1000, 1.0, 0, NULL);
+        if (rc < 0) dropped_observed = 1;
+    }
+    store_stats_t st;
+    store_get_stats(s, &st);
+    assert(dropped_observed);
+    assert(st.shares_dropped > 0);
+
+    /* Don't bother flushing fully -- just close (which drains). */
+    store_close(s);
+    store_test_set_ring_capacity(0);
+    printf("  ok test_drop (dropped=%llu)\n",
+           (unsigned long long)st.shares_dropped);
+}
+
+int main(void) {
+    log_init(2 /* WARN */);
+    printf("running test_store...\n");
+    test_basic();
+    test_rejects();
+    test_concurrent();
+    test_drop();
+    cleanup_dbs();
+    printf("all tests passed\n");
+    return 0;
+}

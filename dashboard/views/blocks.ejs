@@ -1,0 +1,78 @@
+<%
+const fmtN = (n) => new Intl.NumberFormat('en-US').format(n || 0);
+const fmtTs = (t) => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
+const ago = (t) => {
+    if (!t) return '—';
+    const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+};
+const shortHash = (h) => h ? (h.slice(0, 10) + '…' + h.slice(-8)) : '—';
+const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-6) : a) : '—';
+%>
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="60">
+    <title>blocks · simplepool</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header class="top">
+        <a href="/" class="brand">simplepool</a>
+        <span class="tag">blocks found</span>
+    </header>
+    <main class="wrap">
+        <section class="card">
+            <h2>Blocks found by the pool</h2>
+            <% if (rows.length === 0) { %>
+                <p class="muted">No blocks recorded yet.</p>
+            <% } else { %>
+            <table class="lb">
+                <thead>
+                    <tr>
+                        <th>When</th>
+                        <th>Height</th>
+                        <th>Finder</th>
+                        <th>Payout address</th>
+                        <th>Reward</th>
+                        <th>Operator fee</th>
+                        <th>Hash</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <% rows.forEach(b => { %>
+                    <tr>
+                        <td title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
+                        <td><%= fmtN(b.height) %></td>
+                        <td>
+                            <% if (b.finder) { %>
+                                <a href="/worker/<%= encodeURIComponent(b.finder) %>"><%= b.finder %></a>
+                            <% } else { %>—<% } %>
+                        </td>
+                        <td class="mono small" title="<%= b.finder_address || '' %>"><%= shortAddr(b.finder_address) %></td>
+                        <td><%= fmtBtc(b.reward_sats) %></td>
+                        <td><%= fmtBtc(b.fee_sats) %></td>
+                        <td class="mono small" title="<%= b.hash %>"><%= shortHash(b.hash) %></td>
+                    </tr>
+                <% }) %>
+                </tbody>
+            </table>
+            <p class="muted small">
+                <% if (next_before) { %>
+                    <a href="/blocks?before=<%= next_before %>">← older</a>
+                <% } %>
+            </p>
+            <% } %>
+        </section>
+
+        <p><a href="/">← back to overview</a></p>
+    </main>
+    <footer class="foot"><span>read-only · auto-refresh 60s</span></footer>
+    <script src="/static/script.js" defer></script>
+</body>
+</html>

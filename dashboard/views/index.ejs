@@ -1,0 +1,96 @@
+<%
+const fmtN = (n) => new Intl.NumberFormat('en-US').format(n || 0);
+const fmtTs = (t) => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : '—';
+const ago = (t) => {
+    if (!t) return '—';
+    const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+};
+%>
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="15">
+    <title>overview · simplepool</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header class="top">
+        <a href="/" class="brand">simplepool</a>
+        <span class="tag">stratum stats</span>
+    </header>
+    <main class="wrap">
+        <% if (!ov.db_ready) { %>
+            <div class="card warn">
+                <h2>no data yet</h2>
+                <p>The proxy database isn't readable yet. Either the proxy hasn't started or no shares have been submitted.</p>
+            </div>
+        <% } %>
+
+        <section class="card">
+            <h2>Overview · last 24h</h2>
+            <div class="grid">
+                <div><label>Hashrate</label><strong><%= fmtHashrate(ov.hashrate) %></strong></div>
+                <div><label>Accepted</label><strong><%= fmtN(ov.accepted) %></strong></div>
+                <div><label>Rejected</label><strong><%= fmtN(ov.rejected) %></strong></div>
+                <div><label>Blocks</label><strong><%= fmtN(ov.blocks) %></strong></div>
+                <div><label>Active workers</label><strong><%= fmtN(ov.workers_active) %></strong></div>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Worker leaderboard · last 24h</h2>
+            <% if (lb.length === 0) { %>
+                <p class="muted">No workers active in the last 24h.</p>
+            <% } else { %>
+            <table class="lb">
+                <thead>
+                    <tr><th>#</th><th>Worker</th><th>Shares</th><th>Hashrate</th><th>Pool %</th><th>Last seen</th></tr>
+                </thead>
+                <tbody>
+                <% lb.forEach((w, i) => { %>
+                    <tr>
+                        <td><%= i + 1 %></td>
+                        <td><a href="/worker/<%= encodeURIComponent(w.name) %>"><%= w.name %></a></td>
+                        <td><%= fmtN(w.shares) %></td>
+                        <td><%= fmtHashrate(w.hashrate_est) %></td>
+                        <td><%= w.share_of_pool_pct.toFixed(2) %>%</td>
+                        <td title="<%= fmtTs(w.last_seen) %>"><%= ago(w.last_seen) %></td>
+                    </tr>
+                <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>Recent blocks <a class="muted small" href="/blocks" style="float:right">history →</a></h2>
+            <% if (blocks.length === 0) { %>
+                <p class="muted">No blocks found.</p>
+            <% } else { %>
+            <table class="lb">
+                <thead><tr><th>Height</th><th>Finder</th><th>Reward</th><th>Hash</th><th>When</th></tr></thead>
+                <tbody>
+                <% blocks.forEach(b => { %>
+                    <tr>
+                        <td><%= fmtN(b.height) %></td>
+                        <td><% if (b.finder) { %><a href="/worker/<%= encodeURIComponent(b.finder) %>"><%= b.finder %></a><% } else { %>—<% } %></td>
+                        <td><%= fmtBtc(b.reward_sats) %></td>
+                        <td class="mono small"><%= b.hash %></td>
+                        <td title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
+                    </tr>
+                <% }) %>
+                </tbody>
+            </table>
+            <% } %>
+        </section>
+    </main>
+    <footer class="foot"><span>read-only · auto-refresh 15s</span></footer>
+    <script src="/static/script.js" defer></script>
+</body>
+</html>

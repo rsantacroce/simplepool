@@ -1,0 +1,6 @@
+build/
+data/
+*.o
+*.d
+proxy.conf
+.DS_Store

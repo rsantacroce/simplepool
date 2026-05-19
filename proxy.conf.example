@@ -1,0 +1,20 @@
+listen_addr = 0.0.0.0
+listen_port = 3334
+
+bitcoind_url = http://127.0.0.1:18443
+bitcoind_user = drivepool
+bitcoind_pass = drivepool
+bitcoind_poll_interval_ms = 30000
+
+# Miners are paid directly: the stratum username must be the miner's
+# bitcoin address (`<address>` or `<address>.<rig_label>`). The configured
+# operator_address below receives a fee_bps cut of every block reward.
+operator_address = bcrt1q...
+fee_bps = 100              # 100 = 1%; valid range 0..1000 (max 10%)
+coinbase_tag = /simplepool/
+
+db_path = ./data/shares.db
+commit_window_ms = 100
+commit_max_shares = 100
+
+log_level = info

@@ -1,0 +1,74 @@
+#ifndef SIMPLEPOOL_BITCOIND_H
+#define SIMPLEPOOL_BITCOIND_H
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+
+typedef struct {
+    char url[512];
+    char user[128];
+    char pass[256];
+    long timeout_ms;          /* libcurl timeout, default 10000 */
+} bitcoind_cfg_t;
+
+typedef struct {
+    /* opaque CURL handle + lock */
+    void *_curl;
+    void *_lock;              /* pthread_mutex_t* */
+    bitcoind_cfg_t cfg;
+} bitcoind_client_t;
+
+typedef struct bitcoind_template_tx {
+    char *data_hex;           /* owned */
+    char txid_hex[65];        /* null-terminated hex */
+    int64_t fee;
+    int weight;
+} bitcoind_template_tx_t;
+
+typedef struct {
+    int height;
+    char prev_hash_hex[65];
+    int64_t coinbase_value_sats;
+    char target_hex[65];      /* 32-byte target as hex */
+    uint32_t bits;            /* nbits */
+    uint32_t curtime;
+    int32_t version;
+    char *default_witness_commitment; /* owned, may be NULL */
+    int64_t min_time;
+    bitcoind_template_tx_t *txs;       /* owned array */
+    size_t tx_count;
+} bitcoind_template_t;
+
+/* Initialize a client. Does NOT make a network call. Returns 0 on success,
+ * negative on bad config. */
+int bitcoind_client_init(bitcoind_client_t *out, const bitcoind_cfg_t *cfg);
+
+/* Free internal resources. */
+void bitcoind_client_free(bitcoind_client_t *c);
+
+/* Sanity ping — calls getblockchaininfo. Returns 0 ok, negative on RPC/net
+ * error. Useful at startup. */
+int bitcoind_ping(bitcoind_client_t *c, char *errbuf, size_t errlen);
+
+/* Fetch a block template. Allocates the result; caller must call
+ * bitcoind_template_free. Returns 0 ok, negative on error. */
+int bitcoind_get_block_template(bitcoind_client_t *c,
+                                bitcoind_template_t **out,
+                                char *errbuf, size_t errlen);
+
+/* Submit a serialized block (raw hex). Returns 0 if accepted, negative on
+ * error. errbuf gets the rejection reason on negative. */
+int bitcoind_submit_block(bitcoind_client_t *c, const char *block_hex,
+                          char *errbuf, size_t errlen);
+
+void bitcoind_template_free(bitcoind_template_t *t);
+
+/* Internal helper exposed for testing: parse a getblocktemplate JSON
+ * response into a template struct. `result_json` is the value of the JSON
+ * "result" field (cJSON object). Returns 0 ok, negative on missing fields. */
+int bitcoind_parse_template(void /* cJSON* */ *result_json,
+                            bitcoind_template_t **out,
+                            char *errbuf, size_t errlen);
+
+#endif

@@ -1,0 +1,126 @@
+/* Pure share-validation math. No I/O. Mirrors crates/pool-core/src/{share,
+ * merkle,job}.rs byte-for-byte. */
+
+#include "share.h"
+#include "sha256.h"
+
+#include <math.h>
+#include <string.h>
+
+void dsha256(const uint8_t *in, size_t inlen, uint8_t out[32]) {
+    uint8_t tmp[32];
+    sha256(in, inlen, tmp);
+    sha256(tmp, 32, out);
+}
+
+void nbits_to_target(uint32_t nbits, uint8_t target_be[32]) {
+    memset(target_be, 0, 32);
+    uint8_t exp = (uint8_t)(nbits >> 24);
+    uint32_t mant = nbits & 0x007fffffu;
+    int negative = (nbits & 0x00800000u) != 0;
+    if (mant == 0 || negative) return;
+    if (exp <= 3) {
+        unsigned shift = 8u * (3u - exp);
+        uint32_t v = mant >> shift;
+        target_be[29] = (uint8_t)((v >> 16) & 0xff);
+        target_be[30] = (uint8_t)((v >> 8) & 0xff);
+        target_be[31] = (uint8_t)(v & 0xff);
+    } else {
+        size_t off = 32u - (size_t)exp;
+        if (off + 3u <= 32u) {
+            target_be[off]     = (uint8_t)((mant >> 16) & 0xff);
+            target_be[off + 1] = (uint8_t)((mant >> 8) & 0xff);
+            target_be[off + 2] = (uint8_t)(mant & 0xff);
+        }
+    }
+}
+
+/* DIFF1 target: 0x00000000FFFF0000...0000 (BE). Top 128 bits = 0x00000000FFFF0000 0000000000000000. */
+static const uint8_t DIFF1_TARGET[32] = {
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static unsigned __int128 be16_to_u128(const uint8_t b[16]) {
+    unsigned __int128 v = 0;
+    for (int i = 0; i < 16; ++i) {
+        v = (v << 8) | (unsigned __int128)b[i];
+    }
+    return v;
+}
+
+static void u128_to_be16(unsigned __int128 v, uint8_t out[16]) {
+    for (int i = 15; i >= 0; --i) {
+        out[i] = (uint8_t)(v & 0xffu);
+        v >>= 8;
+    }
+}
+
+void worker_diff_to_target(double diff, uint8_t target_be[32]) {
+    memset(target_be, 0, 32);
+    if (!isfinite(diff) || diff <= 0.0) {
+        memset(target_be, 0xff, 32);
+        return;
+    }
+    unsigned __int128 hi = be16_to_u128(DIFF1_TARGET);
+    double scaled = (double)hi / diff;
+    /* Clamp to [0, 2^128 - 1]. */
+    const double max_u128 = ldexp(1.0, 128); /* 2^128 */
+    if (scaled < 0.0) scaled = 0.0;
+    if (scaled >= max_u128) scaled = max_u128 - 1.0;
+    unsigned __int128 hi_scaled = (unsigned __int128)scaled;
+    u128_to_be16(hi_scaled, target_be);
+}
+
+void merkle_root_from_branches(const uint8_t leaf_le[32],
+                               const uint8_t (*branches)[32], size_t n,
+                               uint8_t root_le[32]) {
+    uint8_t cur[32];
+    uint8_t buf[64];
+    memcpy(cur, leaf_le, 32);
+    for (size_t i = 0; i < n; ++i) {
+        memcpy(buf, cur, 32);
+        memcpy(buf + 32, branches[i], 32);
+        dsha256(buf, 64, cur);
+    }
+    memcpy(root_le, cur, 32);
+}
+
+static void put_u32_le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xffu);
+    p[1] = (uint8_t)((v >> 8) & 0xffu);
+    p[2] = (uint8_t)((v >> 16) & 0xffu);
+    p[3] = (uint8_t)((v >> 24) & 0xffu);
+}
+
+void build_header(int32_t version,
+                  const uint8_t prev_hash_le[32],
+                  const uint8_t merkle_root_le[32],
+                  uint32_t ntime, uint32_t nbits, uint32_t nonce,
+                  uint8_t header_out[80]) {
+    put_u32_le(header_out + 0, (uint32_t)version);
+    memcpy(header_out + 4, prev_hash_le, 32);
+    memcpy(header_out + 36, merkle_root_le, 32);
+    put_u32_le(header_out + 68, ntime);
+    put_u32_le(header_out + 72, nbits);
+    put_u32_le(header_out + 76, nonce);
+}
+
+int be32_cmp(const uint8_t a[32], const uint8_t b[32]) {
+    for (int i = 0; i < 32; ++i) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return 1;
+    }
+    return 0;
+}
+
+void hash_header(const uint8_t header[80], uint8_t hash_be[32]) {
+    uint8_t hash_le[32];
+    dsha256(header, 80, hash_le);
+    /* Reverse to BE. */
+    for (int i = 0; i < 32; ++i) {
+        hash_be[i] = hash_le[31 - i];
+    }
+}
