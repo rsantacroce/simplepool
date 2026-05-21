@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static char g_db_paths[8][256];
@@ -32,8 +33,8 @@ static void cleanup_dbs(void) {
     for (int i = 0; i < g_db_count; ++i) {
         unlink(g_db_paths[i]);
         char wal[300], shm[300];
-        snprintf(wal, sizeof(wal), "%s-wal", g_db_paths[i]);
-        snprintf(shm, sizeof(shm), "%s-shm", g_db_paths[i]);
+        snprintf(wal, sizeof(wal), "%.255s-wal", g_db_paths[i]);
+        snprintf(shm, sizeof(shm), "%.255s-shm", g_db_paths[i]);
         unlink(wal);
         unlink(shm);
     }
@@ -176,7 +177,7 @@ static void *thread_fn(void *arg) {
             10000ULL + (uint64_t)i, 2.5, 0, NULL);
         if (rc != 0) {
             /* retry briefly if queue saturated */
-            usleep(100);
+            nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 100000}, NULL);
             --i;
         }
     }

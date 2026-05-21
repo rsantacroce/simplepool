@@ -84,7 +84,7 @@ static void test_merkle(void) {
     dsha256(buf, 64, expected);
     uint8_t branches[1][32];
     memcpy(branches[0], b, 32);
-    merkle_root_from_branches(a, branches, 1, root);
+    merkle_root_from_branches(a, (const uint8_t(*)[32])branches, 1, root);
     CHECK(memcmp(root, expected, 32) == 0);
 
     /* No branches -> root == leaf */

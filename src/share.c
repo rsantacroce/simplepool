@@ -43,15 +43,19 @@ static const uint8_t DIFF1_TARGET[32] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-static unsigned __int128 be16_to_u128(const uint8_t b[16]) {
-    unsigned __int128 v = 0;
+/* __int128 is a compiler extension; the typedef is wrapped in __extension__ so
+ * strict -Wpedantic accepts it, and uses of the typedef name don't warn. */
+__extension__ typedef unsigned __int128 u128;
+
+static u128 be16_to_u128(const uint8_t b[16]) {
+    u128 v = 0;
     for (int i = 0; i < 16; ++i) {
-        v = (v << 8) | (unsigned __int128)b[i];
+        v = (v << 8) | (u128)b[i];
     }
     return v;
 }
 
-static void u128_to_be16(unsigned __int128 v, uint8_t out[16]) {
+static void u128_to_be16(u128 v, uint8_t out[16]) {
     for (int i = 15; i >= 0; --i) {
         out[i] = (uint8_t)(v & 0xffu);
         v >>= 8;
@@ -64,13 +68,13 @@ void worker_diff_to_target(double diff, uint8_t target_be[32]) {
         memset(target_be, 0xff, 32);
         return;
     }
-    unsigned __int128 hi = be16_to_u128(DIFF1_TARGET);
+    u128 hi = be16_to_u128(DIFF1_TARGET);
     double scaled = (double)hi / diff;
     /* Clamp to [0, 2^128 - 1]. */
     const double max_u128 = ldexp(1.0, 128); /* 2^128 */
     if (scaled < 0.0) scaled = 0.0;
     if (scaled >= max_u128) scaled = max_u128 - 1.0;
-    unsigned __int128 hi_scaled = (unsigned __int128)scaled;
+    u128 hi_scaled = (u128)scaled;
     u128_to_be16(hi_scaled, target_be);
 }
 
