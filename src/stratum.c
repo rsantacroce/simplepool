@@ -382,10 +382,19 @@ static cJSON *make_notify_params(const stratum_job_t *j,
     cJSON *p = cJSON_CreateArray();
     cJSON_AddItemToArray(p, cJSON_CreateString(j->job_id));
 
-    /* prev_hash: stratum sends in "natural" word-reversed form. The Rust
-     * server emits the prev_hash_le bytes as hex directly; we mirror. */
+    /* prev_hash: mining.notify uses the stratum convention where the 32-byte
+     * hash is sent with each 4-byte word byte-reversed (word order preserved).
+     * prev_hash_le holds the header-internal little-endian bytes, so we
+     * word-swap before emitting; the miner word-swaps again to recover the
+     * exact bytes that go into the block header. Sending the raw little-endian
+     * bytes makes standard ASICs hash the wrong header (every share rejected
+     * as "low difficulty"). */
     char hex[65];
-    bytes_to_hex(j->prev_hash_le, 32, hex);
+    uint8_t prev_ws[32];
+    for (int wi = 0; wi < 8; ++wi)
+        for (int bi = 0; bi < 4; ++bi)
+            prev_ws[wi * 4 + bi] = j->prev_hash_le[wi * 4 + 3 - bi];
+    bytes_to_hex(prev_ws, 32, hex);
     cJSON_AddItemToArray(p, cJSON_CreateString(hex));
 
     char *cb1_hex = malloc(cb1_len * 2 + 1);
