@@ -63,9 +63,14 @@ typedef struct {
     int    max_conns;            /* default 500 */
     double initial_diff;         /* default 1.0 */
     /* Hedge routing. When upstream_enabled is 0 (default) every connection is
-     * SOLO regardless of pool_fraction. */
+     * SOLO regardless of pool_fraction. The upstream_* fields are the pool a
+     * POOL-routed connection is bridged to (Phase 3). */
     int    upstream_enabled;
     double pool_fraction;        /* 0.0..1.0 of fleet routed to the pool */
+    char   upstream_host[256];
+    int    upstream_port;
+    char   upstream_user[256];   /* operator's pool account, e.g. "addr.worker" */
+    char   upstream_pass[64];
     /* Coinbase split — every connection's coinbase pays the miner directly
      * and routes (value * fee_bps / 10000) to operator_address. */
     char   operator_address[128];
@@ -105,6 +110,10 @@ const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);
 int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
 stratum_route_t stratum_conn_route_for_test(const stratum_conn_t *c);
+
+/* Actual bound listen port (useful when bind_port was 0 = ephemeral). Returns
+ * the port in host byte order, or 0 on error. Exposed for integration tests. */
+int stratum_server_port_for_test(stratum_server_t *s);
 
 /* Pure routing decision (no state): pick a route for a newly-authorized
  * connection given the target pool_fraction and the current solo/pool counts.

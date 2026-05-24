@@ -1,11 +1,20 @@
+#define _POSIX_C_SOURCE 200809L
 #include "../src/stratum.h"
 #include "../src/share.h"
+#include "../src/log.h"
 #include "../src/cjson/cJSON.h"
 
+#include <arpa/inet.h>
 #include <assert.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -351,7 +360,198 @@ static void test_route_classification(void) {
     CHECK(authorize_and_route(1.0, 1, TEST_ADDR) == STRATUM_ROUTE_POOL);
 }
 
+/* ---- end-to-end bridge (Phase 3) --------------------------------------- *
+ * A real miner socket connects to our stratum server; the connection is
+ * routed to a pool (pool_fraction=1.0) and bridged to a throwaway upstream
+ * pool. We assert the upstream's job is forwarded down and a submit is
+ * relayed up and its accept returned to the miner. */
+
+typedef struct {
+    int listen_fd;
+    int port;
+    atomic_int stop;
+    pthread_t thr;
+} fake_pool_t;
+
+static int fp_send_line(int fd, const char *s) {
+    size_t len = strlen(s);
+    char *line = malloc(len + 2);
+    if (!line) return -1;
+    memcpy(line, s, len);
+    line[len] = '\n';
+    line[len + 1] = '\0';
+    ssize_t n = send(fd, line, len + 1, 0);
+    free(line);
+    return n == (ssize_t)(len + 1) ? 0 : -1;
+}
+
+static void *fake_pool_thread(void *arg) {
+    fake_pool_t *fp = arg;
+    int cfd = accept(fp->listen_fd, NULL, NULL);
+    if (cfd < 0) return NULL;
+    char buf[8192];
+    size_t blen = 0;
+    while (!atomic_load(&fp->stop)) {
+        ssize_t n = recv(cfd, buf + blen, sizeof(buf) - 1 - blen, 0);
+        if (n <= 0) break;
+        blen += (size_t)n;
+        buf[blen] = '\0';
+        for (;;) {
+            char *nl = memchr(buf, '\n', blen);
+            if (!nl) break;
+            *nl = '\0';
+            cJSON *root = cJSON_Parse(buf);
+            if (root) {
+                const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
+                const cJSON *method = cJSON_GetObjectItemCaseSensitive(root, "method");
+                long idv = cJSON_IsNumber(id) ? (long)id->valuedouble : 0;
+                char line[1024];
+                if (cJSON_IsString(method)) {
+                    if (strcmp(method->valuestring, "mining.subscribe") == 0) {
+                        snprintf(line, sizeof(line),
+                            "{\"id\":%ld,\"result\":[[[\"mining.set_difficulty\","
+                            "\"1\"],[\"mining.notify\",\"1\"]],\"deadbeef\",4],"
+                            "\"error\":null}", idv);
+                        fp_send_line(cfd, line);
+                        fp_send_line(cfd,
+                            "{\"id\":null,\"method\":\"mining.set_difficulty\","
+                            "\"params\":[256.0]}");
+                        fp_send_line(cfd,
+                            "{\"id\":null,\"method\":\"mining.notify\",\"params\":"
+                            "[\"upjob1\",\"00000000111111112222222233333333"
+                            "44444444555555556666666677777777\",\"0100\",\"ff00\","
+                            "[\"aa\"],\"20000000\",\"170355f0\",\"650a1b2c\",true]}");
+                    } else if (strcmp(method->valuestring, "mining.authorize") == 0) {
+                        snprintf(line, sizeof(line),
+                            "{\"id\":%ld,\"result\":true,\"error\":null}", idv);
+                        fp_send_line(cfd, line);
+                    } else if (strcmp(method->valuestring, "mining.submit") == 0) {
+                        snprintf(line, sizeof(line),
+                            "{\"id\":%ld,\"result\":true,\"error\":null}", idv);
+                        fp_send_line(cfd, line);
+                    }
+                }
+                cJSON_Delete(root);
+            }
+            size_t consumed = (size_t)(nl - buf) + 1;
+            memmove(buf, buf + consumed, blen - consumed);
+            blen -= consumed;
+        }
+    }
+    close(cfd);
+    return NULL;
+}
+
+static int fake_pool_start(fake_pool_t *fp) {
+    memset(fp, 0, sizeof(*fp));
+    atomic_init(&fp->stop, 0);
+    fp->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fp->listen_fd < 0) return -1;
+    int one = 1;
+    setsockopt(fp->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(0x7f000001U);
+    addr.sin_port = 0;
+    if (bind(fp->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) return -1;
+    if (listen(fp->listen_fd, 4) != 0) return -1;
+    socklen_t alen = sizeof(addr);
+    if (getsockname(fp->listen_fd, (struct sockaddr *)&addr, &alen) != 0) return -1;
+    fp->port = ntohs(addr.sin_port);
+    return pthread_create(&fp->thr, NULL, fake_pool_thread, fp);
+}
+
+static void fake_pool_stop(fake_pool_t *fp) {
+    atomic_store(&fp->stop, 1);
+    shutdown(fp->listen_fd, SHUT_RDWR);
+    close(fp->listen_fd);
+    pthread_join(fp->thr, NULL);
+}
+
+static int tcp_connect_local(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(0x7f000001U);
+    addr.sin_port = htons((uint16_t)port);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return fd;
+}
+
+/* Read newline-delimited lines from fd until `want` substring is seen or the
+ * recv timeout elapses. Returns 1 if found. */
+static int read_until(int fd, const char *want, char *acc, size_t acc_cap) {
+    size_t used = strlen(acc);
+    char buf[4096];
+    for (int iter = 0; iter < 50; ++iter) {
+        if (strstr(acc, want)) return 1;
+        ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) break;
+        buf[n] = '\0';
+        if (used + (size_t)n < acc_cap) {
+            memcpy(acc + used, buf, (size_t)n + 1);
+            used += (size_t)n;
+        }
+    }
+    return strstr(acc, want) != NULL;
+}
+
+static void test_bridge_end_to_end(void) {
+    fake_pool_t fp;
+    CHECK(fake_pool_start(&fp) == 0);
+
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 4, .initial_diff = 1.0,
+                          .upstream_enabled = 1, .pool_fraction = 1.0,
+                          .upstream_port = fp.port, .ctx = &obs };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.upstream_host, sizeof(cfg.upstream_host), "127.0.0.1");
+    snprintf(cfg.upstream_user, sizeof(cfg.upstream_user), "poolacct.w1");
+    snprintf(cfg.upstream_pass, sizeof(cfg.upstream_pass), "x");
+
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    int port = stratum_server_port_for_test(s);
+    CHECK(port > 0);
+
+    int fd = tcp_connect_local(port);
+    CHECK(fd >= 0);
+
+    fp_send_line(fd, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}");
+    fp_send_line(fd,
+        "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\""
+        TEST_ADDR "\",\"x\"]}");
+
+    char acc[16384] = {0};
+    /* The upstream job (job_id "upjob1") should be forwarded down to us. */
+    CHECK(read_until(fd, "upjob1", acc, sizeof(acc)));
+    /* And the upstream extranonce + difficulty should be relayed. */
+    CHECK(strstr(acc, "mining.set_extranonce") != NULL);
+    CHECK(strstr(acc, "mining.set_difficulty") != NULL);
+
+    /* Submit a share against the upstream job; expect an accept relayed back
+     * with our submit id (7). */
+    fp_send_line(fd,
+        "{\"id\":7,\"method\":\"mining.submit\",\"params\":[\"" TEST_ADDR
+        "\",\"upjob1\",\"00000000\",\"650a1b2c\",\"00000000\"]}");
+    CHECK(read_until(fd, "\"id\":7", acc, sizeof(acc)));
+    CHECK(strstr(acc, "\"result\":true") != NULL);
+
+    close(fd);
+    stratum_server_free(s);
+    fake_pool_stop(&fp);
+}
+
 int main(void) {
+    log_init(LOG_LVL_ERROR);   /* quiet the bridge logs during tests */
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
     test_submit_unknown_job();
@@ -360,6 +560,7 @@ int main(void) {
     test_authorize_address_with_label();
     test_route_decide();
     test_route_classification();
+    test_bridge_end_to_end();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

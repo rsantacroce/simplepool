@@ -420,6 +420,13 @@ int main(int argc, char **argv) {
              cfg.coinbase_tag);
     stcfg.upstream_enabled = cfg.upstream_enabled;
     stcfg.pool_fraction    = cfg.pool_fraction;
+    snprintf(stcfg.upstream_host, sizeof stcfg.upstream_host, "%s",
+             cfg.upstream_host);
+    stcfg.upstream_port = cfg.upstream_port;
+    snprintf(stcfg.upstream_user, sizeof stcfg.upstream_user, "%s",
+             cfg.upstream_user);
+    snprintf(stcfg.upstream_pass, sizeof stcfg.upstream_pass, "%s",
+             cfg.upstream_pass);
     stcfg.ctx            = &sctx;
     stcfg.on_share       = on_share_cb;
     stcfg.on_reject      = on_reject_cb;

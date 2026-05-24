@@ -18,6 +18,7 @@
 #include "coinbase.h"
 #include "share.h"
 #include "log.h"
+#include "upstream.h"
 #include "cjson/cJSON.h"
 
 #include <arpa/inet.h>
@@ -41,6 +42,7 @@
 #define MAX_LINE_BYTES 16384
 #define DEDUPE_RING    1024
 #define RECENT_JOBS    8
+#define BRIDGE_PENDING 64    /* in-flight upstream submits per bridged conn */
 #define RECENT_JOB_TTL_MS 60000
 
 /* BIP320 reserved version-rolling bits (ASICBoost). Advertised in
@@ -185,6 +187,15 @@ struct stratum_conn {
     stratum_route_t route;         /* SOLO (default) or POOL; set at authorize */
     int      route_counted;        /* 1 once this conn is tallied in route counts */
 
+    /* Upstream bridge (Phase 3). For a POOL-routed connection on a real
+     * socket, `up` is a dedicated outbound client; jobs/difficulty/results
+     * flow through it. `pending` correlates each upstream submit id with the
+     * downstream submit id so the async accept/reject can be returned. */
+    upstream_client_t *up;
+    pthread_mutex_t    pending_lock;
+    struct { long up_id; long down_id; } pending[BRIDGE_PENDING];
+    size_t   pending_head;
+
     /* Per-connection coinbase, rendered against the current job using
      * payout_address (miner) + cfg.operator_address (fee). Refreshed any
      * time we hand out a new notify for a job id we haven't rendered
@@ -210,6 +221,11 @@ static void conn_clear_coinbase(stratum_conn_t *c) {
     free(c->cb2); c->cb2 = NULL; c->cb2_len = 0;
     c->cb_for_job_id[0] = '\0';
 }
+
+/* Bridge (Phase 3) — defined after write_all(); forward-declared for use in
+ * handle_authorize / handle_submit. */
+static int  bridge_try_start(stratum_server_t *s, stratum_conn_t *c);
+static void bridge_remember_submit(stratum_conn_t *c, long up_id, long down_id);
 
 /* ----------------------------------------------------- helpers ---------- */
 
@@ -754,7 +770,16 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 
     /* respond true */
     emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
-    /* Then push initial set_difficulty + notify (renders this conn's
+
+    /* POOL-routed connections are bridged to the upstream pool, which drives
+     * set_extranonce / set_difficulty / notify asynchronously. If the bridge
+     * can't be started (disabled, misconfigured, or a test socket) we fall
+     * through to the solo path so the miner is never left idle. */
+    if (bridge_try_start(s, c)) {
+        return 0;
+    }
+
+    /* Solo path: push initial set_difficulty + notify (renders this conn's
      * coinbase against the current job using its payout address). */
     send_set_difficulty(buf, len, c->difficulty);
     send_current_notify(s, c, buf, len, 1);
@@ -819,6 +844,29 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     const char *ntime  = cJSON_GetArrayItem(params, 3)->valuestring;
     const char *nonce  = cJSON_GetArrayItem(params, 4)->valuestring;
     (void)worker;
+
+    /* Bridged (POOL) connection: this share is for the upstream pool's job, so
+     * forward it verbatim under the operator's pool account and let the async
+     * upstream result drive the response (no solo validation here). The job_id,
+     * extranonce2, ntime and nonce are exactly what the miner hashed against
+     * the upstream-forwarded notify. The optional version (BIP310) is relayed
+     * as-is; faithful negotiation with the upstream is a Phase 4 refinement. */
+    if (c->up) {
+        const char *version = NULL;
+        if (cJSON_GetArraySize(params) >= 6) {
+            cJSON *v = cJSON_GetArrayItem(params, 5);
+            if (cJSON_IsString(v)) version = v->valuestring;
+        }
+        long down_id = cJSON_IsNumber(id) ? (long)id->valuedouble : -1;
+        long up_id = upstream_submit(c->up, s->cfg.upstream_user,
+                                     jid, en2, ntime, nonce, version);
+        if (up_id < 0) {
+            cJSON *err = make_error(20, "upstream unavailable");
+            return emit_response(buf, len, id, NULL, err);
+        }
+        bridge_remember_submit(c, up_id, down_id);
+        return 0;   /* response sent later by bridge_on_submit_result */
+    }
 
     stratum_job_t *job = find_job(s, jid);
     if (!job) {
@@ -1014,13 +1062,16 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     c->fd = -1;
     c->difficulty = s ? s->cfg.initial_diff : 1.0;
     pthread_mutex_init(&c->write_lock, NULL);
+    pthread_mutex_init(&c->pending_lock, NULL);
     return c;
 }
 
 void stratum_conn_free_for_test(stratum_conn_t *c) {
     if (!c) return;
+    if (c->up) { upstream_client_free(c->up); c->up = NULL; }
     conn_clear_coinbase(c);
     pthread_mutex_destroy(&c->write_lock);
+    pthread_mutex_destroy(&c->pending_lock);
     free(c);
 }
 
@@ -1039,6 +1090,13 @@ int stratum_conn_subscribed_for_test(const stratum_conn_t *c) {
 stratum_route_t stratum_conn_route_for_test(const stratum_conn_t *c) {
     return c ? c->route : STRATUM_ROUTE_SOLO;
 }
+int stratum_server_port_for_test(stratum_server_t *s) {
+    if (!s || s->listen_fd < 0) return 0;
+    struct sockaddr_in addr;
+    socklen_t alen = sizeof(addr);
+    if (getsockname(s->listen_fd, (struct sockaddr *)&addr, &alen) != 0) return 0;
+    return (int)ntohs(addr.sin_port);
+}
 
 /* ---- real connection thread ------------------------------------------ */
 
@@ -1050,6 +1108,160 @@ static int write_all(int fd, const char *buf, size_t len) {
         off += (size_t)n;
     }
     return 0;
+}
+
+/* ---- upstream bridge (Phase 3) ---------------------------------------- *
+ * These callbacks run on a connection's upstream-client thread and write
+ * straight to the downstream miner's socket under its write_lock. The client
+ * is torn down (joined) before the connection is freed, so the conn pointer
+ * stays valid for the lifetime of every callback. */
+
+/* Serialize a JSON object to a newline-terminated line and send it to the
+ * downstream miner. Takes ownership of obj. */
+static void bridge_write_line(stratum_conn_t *c, cJSON *obj) {
+    char *s = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (!s) return;
+    size_t n = strlen(s);
+    char *line = malloc(n + 2);
+    if (line) {
+        memcpy(line, s, n);
+        line[n] = '\n';
+        line[n + 1] = '\0';
+        pthread_mutex_lock(&c->write_lock);
+        if (c->fd >= 0) write_all(c->fd, line, n + 1);
+        pthread_mutex_unlock(&c->write_lock);
+        free(line);
+    }
+    free(s);
+}
+
+static void bridge_on_job(void *ctx, const upstream_job_t *job) {
+    stratum_conn_t *c = ctx;
+    cJSON *p = cJSON_CreateArray();
+    cJSON_AddItemToArray(p, cJSON_CreateString(job->job_id));
+    cJSON_AddItemToArray(p, cJSON_CreateString(job->prev_hash));
+    cJSON_AddItemToArray(p, cJSON_CreateString(job->coinb1 ? job->coinb1 : ""));
+    cJSON_AddItemToArray(p, cJSON_CreateString(job->coinb2 ? job->coinb2 : ""));
+    cJSON *mb = cJSON_CreateArray();
+    for (int i = 0; i < job->merkle_count; ++i)
+        cJSON_AddItemToArray(mb, cJSON_CreateString(job->merkle_branch[i]));
+    cJSON_AddItemToArray(p, mb);
+    cJSON_AddItemToArray(p, cJSON_CreateString(job->version));
+    cJSON_AddItemToArray(p, cJSON_CreateString(job->nbits));
+    cJSON_AddItemToArray(p, cJSON_CreateString(job->ntime));
+    cJSON_AddItemToArray(p, cJSON_CreateBool(job->clean_jobs));
+
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddItemToObject(obj, "id", cJSON_CreateNull());
+    cJSON_AddStringToObject(obj, "method", "mining.notify");
+    cJSON_AddItemToObject(obj, "params", p);
+    bridge_write_line(c, obj);
+}
+
+static void bridge_on_set_difficulty(void *ctx, double difficulty) {
+    stratum_conn_t *c = ctx;
+    c->difficulty = difficulty;
+    cJSON *p = cJSON_CreateArray();
+    cJSON_AddItemToArray(p, cJSON_CreateNumber(difficulty));
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddItemToObject(obj, "id", cJSON_CreateNull());
+    cJSON_AddStringToObject(obj, "method", "mining.set_difficulty");
+    cJSON_AddItemToObject(obj, "params", p);
+    bridge_write_line(c, obj);
+}
+
+static void bridge_on_set_extranonce(void *ctx, const char *en1_hex, int en2_size) {
+    stratum_conn_t *c = ctx;
+    cJSON *p = cJSON_CreateArray();
+    cJSON_AddItemToArray(p, cJSON_CreateString(en1_hex ? en1_hex : ""));
+    cJSON_AddItemToArray(p, cJSON_CreateNumber(en2_size));
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddItemToObject(obj, "id", cJSON_CreateNull());
+    cJSON_AddStringToObject(obj, "method", "mining.set_extranonce");
+    cJSON_AddItemToObject(obj, "params", p);
+    bridge_write_line(c, obj);
+}
+
+static void bridge_remember_submit(stratum_conn_t *c, long up_id, long down_id) {
+    pthread_mutex_lock(&c->pending_lock);
+    c->pending[c->pending_head].up_id   = up_id;
+    c->pending[c->pending_head].down_id = down_id;
+    c->pending_head = (c->pending_head + 1) % BRIDGE_PENDING;
+    pthread_mutex_unlock(&c->pending_lock);
+}
+
+static void bridge_on_submit_result(void *ctx, long up_id, int accepted,
+                                    const char *err) {
+    stratum_conn_t *c = ctx;
+    long down_id = -1;
+    pthread_mutex_lock(&c->pending_lock);
+    for (size_t i = 0; i < BRIDGE_PENDING; ++i) {
+        if (c->pending[i].up_id == up_id) {
+            down_id = c->pending[i].down_id;
+            c->pending[i].up_id = 0;   /* consume (ids start at 1) */
+            break;
+        }
+    }
+    pthread_mutex_unlock(&c->pending_lock);
+    if (down_id < 0) return;   /* unknown / already answered */
+
+    if (c->server && c->server->cfg.on_reject && !accepted) {
+        c->server->cfg.on_reject(c->server->cfg.ctx, c->worker_name, now_ms(),
+                                 err ? err : "upstream rejected");
+    }
+
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddItemToObject(obj, "id", cJSON_CreateNumber((double)down_id));
+    cJSON_AddItemToObject(obj, "result",
+                          accepted ? cJSON_CreateTrue() : cJSON_CreateFalse());
+    cJSON_AddItemToObject(obj, "error",
+                          accepted ? cJSON_CreateNull()
+                                   : make_error(23, err ? err : "rejected"));
+    bridge_write_line(c, obj);
+}
+
+static void bridge_on_state(void *ctx, int connected) {
+    stratum_conn_t *c = ctx;
+    LOG_INFO("stratum: bridge for %s upstream %s",
+             c->worker_name[0] ? c->worker_name : "?",
+             connected ? "connected" : "disconnected");
+}
+
+static int bridge_try_start(stratum_server_t *s, stratum_conn_t *c) {
+    if (c->route != STRATUM_ROUTE_POOL) return 0;
+    if (!s->cfg.upstream_enabled)       return 0;
+    if (c->fd < 0)                      return 0;   /* tests / no real socket */
+    if (s->cfg.upstream_host[0] == '\0' || s->cfg.upstream_port <= 0) return 0;
+
+    upstream_cfg_t ucfg;
+    memset(&ucfg, 0, sizeof ucfg);
+    snprintf(ucfg.host, sizeof ucfg.host, "%s", s->cfg.upstream_host);
+    ucfg.port = s->cfg.upstream_port;
+    snprintf(ucfg.user, sizeof ucfg.user, "%s", s->cfg.upstream_user);
+    snprintf(ucfg.pass, sizeof ucfg.pass, "%s", s->cfg.upstream_pass);
+    ucfg.reconnect_min_ms = 1000;
+    ucfg.reconnect_max_ms = 30000;
+
+    upstream_callbacks_t cb;
+    memset(&cb, 0, sizeof cb);
+    cb.ctx = c;
+    cb.on_job            = bridge_on_job;
+    cb.on_set_difficulty = bridge_on_set_difficulty;
+    cb.on_set_extranonce = bridge_on_set_extranonce;
+    cb.on_submit_result  = bridge_on_submit_result;
+    cb.on_state          = bridge_on_state;
+
+    char err[256] = {0};
+    if (upstream_client_start(&ucfg, &cb, &c->up, err, sizeof err) != 0) {
+        LOG_WARN("stratum: bridge start failed for %s: %s; serving solo",
+                 c->worker_name, err);
+        c->up = NULL;
+        return 0;
+    }
+    LOG_INFO("stratum: bridged %s -> upstream %s:%d",
+             c->worker_name, ucfg.host, ucfg.port);
+    return 1;
 }
 
 static void conn_register(stratum_server_t *s, stratum_conn_t *c) {
@@ -1103,7 +1315,11 @@ static void *conn_thread(void *arg) {
         }
     }
 done:
+    /* Tear down the upstream bridge first: this joins the client thread so no
+     * callback can write to the socket after we close it. */
+    if (c->up) { upstream_client_free(c->up); c->up = NULL; }
     close(c->fd);
+    c->fd = -1;
     conn_unregister(s, c);
     conn_release_route(s, c);
     atomic_fetch_sub(&s->conn_count, 1);
