@@ -18,3 +18,21 @@ commit_window_ms = 100
 commit_max_shares = 100
 
 log_level = info
+
+# --- Upstream hedge (solo + pool hashrate split) ----------------------------
+# Route a fraction of the fleet to an upstream pool for steady income while the
+# rest mines the solo template above. A pool's job pays the pool, so this hedges
+# variance — it does NOT improve your solo block odds. Disabled by default.
+# See docs/upstream-hedge-design.md.
+#
+# NOTE: as of Phase 2 the routing decision is made and logged, but pool-routed
+# miners are not yet bridged to the upstream (that lands in Phase 3); they keep
+# receiving solo work until then.
+upstream_enabled = false
+# upstream_host = btc.f2pool.com
+# upstream_port = 1314
+# upstream_user = your_account.worker        # pool account / payout.worker
+# upstream_pass = x
+# Fraction of the fleet (0.0–1.0) routed to the pool. A worker name ending in
+# ".solo" or ".pool" overrides this per-rig.
+pool_fraction = 0.0

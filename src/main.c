@@ -418,6 +418,8 @@ int main(int argc, char **argv) {
     stcfg.fee_bps      = cfg.fee_bps;
     snprintf(stcfg.coinbase_tag, sizeof stcfg.coinbase_tag, "%s",
              cfg.coinbase_tag);
+    stcfg.upstream_enabled = cfg.upstream_enabled;
+    stcfg.pool_fraction    = cfg.pool_fraction;
     stcfg.ctx            = &sctx;
     stcfg.on_share       = on_share_cb;
     stcfg.on_reject      = on_reject_cb;

@@ -278,6 +278,79 @@ static void test_authorize_address_with_label(void) {
     stratum_server_free(s);
 }
 
+/* ---- hedge routing (Phase 2) ------------------------------------------- */
+
+static void test_route_decide(void) {
+    int ov = -1;
+
+    /* fraction 0 -> all solo; fraction 1 -> all pool */
+    CHECK(stratum_route_decide(0.0, 0, 0, "addr", &ov) == STRATUM_ROUTE_SOLO);
+    CHECK(ov == 0);
+    CHECK(stratum_route_decide(1.0, 5, 0, "addr", &ov) == STRATUM_ROUTE_POOL);
+
+    /* per-worker overrides win regardless of fraction */
+    CHECK(stratum_route_decide(0.0, 0, 0, "addr.pool", &ov) == STRATUM_ROUTE_POOL);
+    CHECK(ov == 1);
+    CHECK(stratum_route_decide(1.0, 0, 0, "addr.solo", &ov) == STRATUM_ROUTE_SOLO);
+    CHECK(ov == 1);
+
+    /* 20% converges to 2 pool of 10 over a sequential fleet */
+    int solo = 0, pool = 0;
+    for (int i = 0; i < 10; ++i) {
+        if (stratum_route_decide(0.2, solo, pool, "addr", &ov) == STRATUM_ROUTE_POOL)
+            pool++;
+        else
+            solo++;
+    }
+    CHECK(pool == 2);
+    CHECK(solo == 8);
+
+    /* 50% converges to 5/5 */
+    solo = pool = 0;
+    for (int i = 0; i < 10; ++i) {
+        if (stratum_route_decide(0.5, solo, pool, "addr", &ov) == STRATUM_ROUTE_POOL)
+            pool++;
+        else
+            solo++;
+    }
+    CHECK(pool == 5);
+    CHECK(solo == 5);
+}
+
+static stratum_route_t authorize_and_route(double frac, int enabled,
+                                           const char *worker) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .upstream_enabled = enabled, .pool_fraction = frac,
+                          .ctx = &obs };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+        "{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",
+        worker);
+    stratum_handle_message(s, c, msg, &out, &olen);
+    stratum_route_t r = stratum_conn_route_for_test(c);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    return r;
+}
+
+static void test_route_classification(void) {
+    /* .pool override routes to the pool when upstream is enabled */
+    CHECK(authorize_and_route(0.0, 1, TEST_ADDR ".pool") == STRATUM_ROUTE_POOL);
+    /* .solo override stays solo even at fraction 1.0 */
+    CHECK(authorize_and_route(1.0, 1, TEST_ADDR ".solo") == STRATUM_ROUTE_SOLO);
+    /* upstream disabled -> always solo, even with a .pool override */
+    CHECK(authorize_and_route(0.0, 0, TEST_ADDR ".pool") == STRATUM_ROUTE_SOLO);
+    /* fraction 1.0, plain worker -> pool */
+    CHECK(authorize_and_route(1.0, 1, TEST_ADDR) == STRATUM_ROUTE_POOL);
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -285,6 +358,8 @@ int main(void) {
     test_submit_share_and_dedupe();
     test_authorize_rejects_non_address();
     test_authorize_address_with_label();
+    test_route_decide();
+    test_route_classification();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

@@ -28,6 +28,16 @@ typedef struct {
 
     /* logging */
     int  log_level;            /* 0..3 */
+
+    /* upstream hedge — route a fraction of the fleet to an upstream pool for
+     * steady income while the rest mines the operator's solo template. See
+     * docs/upstream-hedge-design.md. Disabled by default (pure solo). */
+    int    upstream_enabled;     /* master switch, default 0 */
+    char   upstream_host[256];
+    int    upstream_port;
+    char   upstream_user[256];   /* our pool account, e.g. "bcaddr.worker" */
+    char   upstream_pass[64];    /* usually "x" */
+    double pool_fraction;        /* 0.0..1.0 of the fleet routed to the pool */
 } proxy_config_t;
 
 void proxy_config_defaults(proxy_config_t *cfg);

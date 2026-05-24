@@ -49,11 +49,23 @@ typedef void (*block_found_fn)(void *ctx,
                                const char *block_hash,
                                int64_t reward_sats, int64_t fee_sats);
 
+/* Where a connection's hashrate is directed. SOLO mines the operator's own
+ * block template (full reward on a solve); POOL is bridged to an upstream pool
+ * (steady third-party income). See docs/upstream-hedge-design.md. */
+typedef enum {
+    STRATUM_ROUTE_SOLO = 0,
+    STRATUM_ROUTE_POOL = 1
+} stratum_route_t;
+
 typedef struct {
     char   bind_addr[64];
     int    bind_port;
     int    max_conns;            /* default 500 */
     double initial_diff;         /* default 1.0 */
+    /* Hedge routing. When upstream_enabled is 0 (default) every connection is
+     * SOLO regardless of pool_fraction. */
+    int    upstream_enabled;
+    double pool_fraction;        /* 0.0..1.0 of fleet routed to the pool */
     /* Coinbase split — every connection's coinbase pays the miner directly
      * and routes (value * fee_bps / 10000) to operator_address. */
     char   operator_address[128];
@@ -92,6 +104,16 @@ const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);
 const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);
 int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
+stratum_route_t stratum_conn_route_for_test(const stratum_conn_t *c);
+
+/* Pure routing decision (no state): pick a route for a newly-authorized
+ * connection given the target pool_fraction and the current solo/pool counts.
+ * A worker name ending in ".solo" or ".pool" forces that route (and sets
+ * *override_used to 1 if non-NULL). Otherwise a greedy rule converges the live
+ * mix toward pool_fraction. Exposed for unit testing. */
+stratum_route_t stratum_route_decide(double pool_fraction,
+                                     int solo_count, int pool_count,
+                                     const char *worker, int *override_used);
 
 /* Process one JSON-RPC line. Appends one or more newline-delimited JSON
  * messages to *out_buf (caller-owned, will be realloc'd). Returns 0 on

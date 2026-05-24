@@ -39,6 +39,26 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->commit_max_shares = 100;
 
     cfg->log_level = 1; /* info */
+
+    cfg->upstream_enabled = 0;
+    cfg->upstream_host[0] = '\0';
+    cfg->upstream_port    = 0;
+    cfg->upstream_user[0] = '\0';
+    snprintf(cfg->upstream_pass, sizeof cfg->upstream_pass, "%s", "x");
+    cfg->pool_fraction    = 0.0;
+}
+
+/* Parse a boolean-ish value: 1/0, true/false, yes/no, on/off. */
+static int parse_bool(const char *v, int *out) {
+    if (strcasecmp(v, "1") == 0 || strcasecmp(v, "true") == 0 ||
+        strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0) {
+        *out = 1; return 0;
+    }
+    if (strcasecmp(v, "0") == 0 || strcasecmp(v, "false") == 0 ||
+        strcasecmp(v, "no") == 0 || strcasecmp(v, "off") == 0) {
+        *out = 0; return 0;
+    }
+    return -1;
 }
 
 static char *strtrim(char *s) {
@@ -135,6 +155,16 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                 cfg->log_level = lv;
             }
         }
+        else if (strcmp(k, "upstream_enabled")          == 0) {
+            int b = 0;
+            if (parse_bool(v, &b) == 0) cfg->upstream_enabled = b;
+            else LOG_WARN("config: line %d: invalid upstream_enabled '%s'", lineno, v);
+        }
+        else if (strcmp(k, "upstream_host")             == 0) copy_str(cfg->upstream_host, sizeof cfg->upstream_host, v);
+        else if (strcmp(k, "upstream_port")             == 0) cfg->upstream_port = atoi(v);
+        else if (strcmp(k, "upstream_user")             == 0) copy_str(cfg->upstream_user, sizeof cfg->upstream_user, v);
+        else if (strcmp(k, "upstream_pass")             == 0) copy_str(cfg->upstream_pass, sizeof cfg->upstream_pass, v);
+        else if (strcmp(k, "pool_fraction")             == 0) cfg->pool_fraction = atof(v);
         else {
             LOG_WARN("config: line %d: unknown key '%s'", lineno, k);
         }
@@ -151,6 +181,23 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                 "config: 'fee_bps' must be in [0, 1000] (0%% to 10%%), got %d",
                 cfg->fee_bps);
         return -4;
+    }
+
+    /* Clamp pool_fraction to [0,1] rather than failing — a typo shouldn't take
+     * the pool down, just log it. */
+    if (cfg->pool_fraction < 0.0 || cfg->pool_fraction > 1.0) {
+        LOG_WARN("config: 'pool_fraction' %.3f out of [0,1], clamping",
+                 cfg->pool_fraction);
+        cfg->pool_fraction = cfg->pool_fraction < 0.0 ? 0.0 : 1.0;
+    }
+    if (cfg->upstream_enabled) {
+        if (cfg->upstream_host[0] == '\0' || cfg->upstream_port <= 0 ||
+            cfg->upstream_user[0] == '\0') {
+            set_err(errbuf, errlen,
+                    "config: upstream_enabled requires upstream_host, "
+                    "upstream_port and upstream_user");
+            return -5;
+        }
     }
     return 0;
 }

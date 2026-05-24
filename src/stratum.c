@@ -161,6 +161,12 @@ struct stratum_server {
     /* List of live connections — for broadcasting notify on job swap. */
     pthread_mutex_t  conns_lock;
     struct stratum_conn *conns_head;
+
+    /* Hedge routing bookkeeping. route_lock makes the read-counts-then-decide
+     * step atomic so concurrent authorizes converge toward pool_fraction. */
+    pthread_mutex_t  route_lock;
+    int              solo_routed;
+    int              pool_routed;
 };
 
 struct stratum_conn {
@@ -176,6 +182,8 @@ struct stratum_conn {
     uint32_t version_mask;         /* negotiated version-rolling bits; 0 = off */
     char     worker_name[129];     /* full stratum username (sanitized) */
     char     payout_address[128];  /* validated bech32/base58 */
+    stratum_route_t route;         /* SOLO (default) or POOL; set at authorize */
+    int      route_counted;        /* 1 once this conn is tallied in route counts */
 
     /* Per-connection coinbase, rendered against the current job using
      * payout_address (miner) + cfg.operator_address (fee). Refreshed any
@@ -626,6 +634,67 @@ static int handle_configure(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     return emit_response(buf, len, id, result, NULL);
 }
 
+stratum_route_t stratum_route_decide(double pool_fraction,
+                                     int solo_count, int pool_count,
+                                     const char *worker, int *override_used) {
+    if (override_used) *override_used = 0;
+
+    /* Explicit per-worker override via name suffix. */
+    if (worker) {
+        size_t n = strlen(worker);
+        if (n >= 5 && strcmp(worker + n - 5, ".solo") == 0) {
+            if (override_used) *override_used = 1;
+            return STRATUM_ROUTE_SOLO;
+        }
+        if (n >= 5 && strcmp(worker + n - 5, ".pool") == 0) {
+            if (override_used) *override_used = 1;
+            return STRATUM_ROUTE_POOL;
+        }
+    }
+
+    if (pool_fraction <= 0.0) return STRATUM_ROUTE_SOLO;
+    if (pool_fraction >= 1.0) return STRATUM_ROUTE_POOL;
+
+    /* Greedy convergence: route to pool while the pool count is below its
+     * target share of the fleet (counting this new connection), rounded
+     * half-up. With fraction=0.2 the sequence is S,S,S,S,P,S,S,S,S,P,... */
+    int total  = solo_count + pool_count;
+    int target = (int)(pool_fraction * (double)(total + 1) + 0.5);
+    return (pool_count < target) ? STRATUM_ROUTE_POOL : STRATUM_ROUTE_SOLO;
+}
+
+/* Classify a connection at authorize time and tally it, under route_lock. */
+static void conn_assign_route(stratum_server_t *s, stratum_conn_t *c,
+                              const char *worker) {
+    if (!s->cfg.upstream_enabled) {
+        c->route = STRATUM_ROUTE_SOLO;
+        return;
+    }
+    pthread_mutex_lock(&s->route_lock);
+    int ov = 0;
+    c->route = stratum_route_decide(s->cfg.pool_fraction,
+                                    s->solo_routed, s->pool_routed, worker, &ov);
+    if (c->route == STRATUM_ROUTE_POOL) s->pool_routed++;
+    else                                s->solo_routed++;
+    c->route_counted = 1;
+    pthread_mutex_unlock(&s->route_lock);
+    LOG_INFO("stratum: %s routed to %s%s (mix solo=%d pool=%d)",
+             worker ? worker : "?",
+             c->route == STRATUM_ROUTE_POOL ? "POOL" : "SOLO",
+             ov ? " [override]" : "",
+             s->solo_routed, s->pool_routed);
+}
+
+/* Undo the route tally when a connection goes away. */
+static void conn_release_route(stratum_server_t *s, stratum_conn_t *c) {
+    if (!c->route_counted) return;
+    pthread_mutex_lock(&s->route_lock);
+    if (c->route == STRATUM_ROUTE_POOL) { if (s->pool_routed > 0) s->pool_routed--; }
+    else                                { if (s->solo_routed > 0) s->solo_routed--; }
+    c->route_counted = 0;
+    pthread_mutex_unlock(&s->route_lock);
+}
+
 static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                             cJSON *params, char **buf, size_t *len) {
     const char *worker = NULL;
@@ -676,6 +745,12 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
     c->authorized = 1;
     if (c->difficulty <= 0) c->difficulty = s->cfg.initial_diff;
+
+    /* Decide solo vs upstream-pool for this connection (Phase 2). The bridge
+     * that actually serves pool work lands in Phase 3; until then pool-routed
+     * connections still receive solo work, but the classification + live mix
+     * are tracked and logged. */
+    conn_assign_route(s, c, c->worker_name);
 
     /* respond true */
     emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
@@ -961,6 +1036,9 @@ int stratum_conn_authorized_for_test(const stratum_conn_t *c) {
 int stratum_conn_subscribed_for_test(const stratum_conn_t *c) {
     return c ? c->subscribed : 0;
 }
+stratum_route_t stratum_conn_route_for_test(const stratum_conn_t *c) {
+    return c ? c->route : STRATUM_ROUTE_SOLO;
+}
 
 /* ---- real connection thread ------------------------------------------ */
 
@@ -1027,6 +1105,7 @@ static void *conn_thread(void *arg) {
 done:
     close(c->fd);
     conn_unregister(s, c);
+    conn_release_route(s, c);
     atomic_fetch_sub(&s->conn_count, 1);
     stratum_conn_free_for_test(c);
     return NULL;
@@ -1078,6 +1157,7 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     pthread_rwlock_init(&s->job_lock, NULL);
     pthread_mutex_init(&s->recent_lock, NULL);
     pthread_mutex_init(&s->conns_lock, NULL);
+    pthread_mutex_init(&s->route_lock, NULL);
     atomic_init(&s->stop, 0);
     atomic_init(&s->conn_count, 0);
     atomic_init(&s->extranonce1_seq, (unsigned)now_ms());
@@ -1161,5 +1241,6 @@ void stratum_server_free(stratum_server_t *s) {
     pthread_rwlock_destroy(&s->job_lock);
     pthread_mutex_destroy(&s->recent_lock);
     pthread_mutex_destroy(&s->conns_lock);
+    pthread_mutex_destroy(&s->route_lock);
     free(s);
 }
