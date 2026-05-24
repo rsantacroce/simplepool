@@ -48,7 +48,7 @@ BIN       := $(BUILD_DIR)/simplepool
 # Sources compiled in this wave. More modules land in later waves.
 SRCS := src/main.c src/log.c src/config.c src/coinbase.c \
         src/share.c src/sha256.c src/stratum.c src/store.c \
-        src/bitcoind.c src/cjson/cJSON.c
+        src/bitcoind.c src/upstream.c src/cjson/cJSON.c
 OBJS := $(SRCS:%.c=$(BUILD_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 
@@ -74,13 +74,15 @@ include tests/test_bitcoind.mk
 include tests/test_stratum.mk
 include tests/test_store.mk
 include tests/test_coinbase.mk
+include tests/test_upstream.mk
 
-test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase
+test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_upstream
 	./build/test_share
 	./build/test_bitcoind
 	./build/test_stratum
 	./build/test_store
 	./build/test_coinbase
+	./build/test_upstream
 
 format:
 	@if command -v clang-format >/dev/null 2>&1; then \
