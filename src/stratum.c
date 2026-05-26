@@ -881,9 +881,12 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     free(cb);
 
     if (s->cfg.on_share) {
+        /* Always pass the actual share hash so the dashboard can show the
+         * hash of every share (and the user can eyeball its leading zeros
+         * to gauge how lucky each share was). When is_block, this string
+         * also IS the block hash; otherwise it's a 'just-a-share' hash. */
         s->cfg.on_share(s->cfg.ctx, c->worker_name, c->payout_address,
-                        ts_now, c->difficulty, is_block,
-                        is_block ? block_hash_hex : NULL);
+                        ts_now, c->difficulty, is_block, sent_hash_hex);
     }
     if (is_block && s->cfg.on_block_found) {
         int64_t fee_sats = 0;

@@ -177,13 +177,36 @@ export function worker(handle, name, windowSec = 86400) {
 
     const since = Math.floor(Date.now() / 1000) - windowSec;
 
-    const shares = d.prepare(`
-        SELECT ts, difficulty, is_block, block_hash
+    const sharesRaw = d.prepare(`
+        SELECT ts, difficulty, is_block, block_hash AS share_hash
           FROM shares
          WHERE worker_id = ?
          ORDER BY ts DESC
          LIMIT 200
     `).all(w.id);
+
+    // Compute the share's "actual difficulty": diff1_target / hash_value.
+    // diff1_target = 0x00000000_ffff0000_0000... (256-bit), so actual_diff
+    // approximates 2^32 / int(top 8 hex digits) for the leading non-zero
+    // 32 bits. Plenty good for ranking 'how lucky was each share'.
+    const shares = sharesRaw.map(s => {
+        let actual = null;
+        if (s.share_hash && /^[0-9a-fA-F]+$/.test(s.share_hash)) {
+            // Hash is big-endian hex. Skip the leading zeros, take next 8
+            // hex chars as a 32-bit value, then actual_diff ≈ 0xffff0000 / v.
+            const h = s.share_hash.toLowerCase();
+            let i = 0;
+            while (i < h.length && h[i] === '0') i++;
+            const slice = h.slice(i, i + 8).padEnd(8, '0');
+            const v = parseInt(slice, 16);
+            if (v > 0) {
+                // Leading zeros add 16^(zeros) ≈ 4*zeros bits of difficulty.
+                const zeroFactor = Math.pow(16, i);
+                actual = (0xffff0000 / v) * zeroFactor;
+            }
+        }
+        return { ...s, actual_diff: actual };
+    });
 
     const sumRow = d.prepare(`
         SELECT COALESCE(SUM(difficulty),0) AS sum_diff,

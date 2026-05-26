@@ -518,16 +518,16 @@ void store_close(store_t *s) {
 
 int store_record_share(store_t *s, const char *worker_name,
                        uint64_t ts_ms, double difficulty,
-                       int is_block, const char *block_hash_or_null)
+                       int is_block, const char *share_hash_or_null)
 {
     return store_record_share_addr(s, worker_name, NULL, ts_ms, difficulty,
-                                   is_block, block_hash_or_null);
+                                   is_block, share_hash_or_null);
 }
 
 int store_record_share_addr(store_t *s, const char *worker_name,
                             const char *payout_address,
                             uint64_t ts_ms, double difficulty,
-                            int is_block, const char *block_hash_or_null)
+                            int is_block, const char *share_hash_or_null)
 {
     if (!s || !worker_name) return -1;
     event_t ev;
@@ -539,8 +539,8 @@ int store_record_share_addr(store_t *s, const char *worker_name,
     strncpy(ev.worker_name, worker_name, WORKER_NAME_MAX - 1);
     if (payout_address)
         strncpy(ev.payout_address, payout_address, ADDR_MAX - 1);
-    if (block_hash_or_null) {
-        strncpy(ev.hash, block_hash_or_null, HASH_STR_MAX - 1);
+    if (share_hash_or_null) {
+        strncpy(ev.hash, share_hash_or_null, HASH_STR_MAX - 1);
     }
     if (enqueue(s, &ev) != 0) {
         atomic_fetch_add(&s->shares_dropped, 1);
