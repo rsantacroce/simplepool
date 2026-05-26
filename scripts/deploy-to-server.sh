@@ -106,7 +106,11 @@ run_remote "cd ${ROOT} && make"
 
 if [[ "$DO_DASH" == "1" ]]; then
     echo "==> [4/8] npm install in dashboard/"
-    run_remote "cd ${ROOT}/dashboard && npm install --no-audit --no-fund"
+    # `npm install` may pull a better-sqlite3 prebuilt binary compiled
+    # against a different Node ABI than what's installed here. `npm
+    # rebuild` recompiles native modules against the local Node so the
+    # dashboard doesn't crash with NODE_MODULE_VERSION mismatch at start.
+    run_remote "cd ${ROOT}/dashboard && npm install --no-audit --no-fund && npm rebuild"
 fi
 
 echo "==> [5/8] init sqlite schema if missing"
