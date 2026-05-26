@@ -77,8 +77,13 @@ fi
 export SUDO_PASS
 
 run_sudo() {
-    # Pipe the password to sudo -S over ssh, suppress its prompt.
-    "${SSH[@]}" "echo '$SUDO_PASS' | sudo -S -p '' bash -c \"$*\""
+    # base64-encode BOTH the password and the command so quoting/special
+    # characters in either never appear unescaped on the remote side.
+    # base64 output is [A-Za-z0-9+/=] which is safe inside any shell quoting.
+    local pw_b64 cmd_b64
+    pw_b64="$(printf '%s\n' "$SUDO_PASS" | base64 | tr -d '\n')"
+    cmd_b64="$(printf '%s' "$*" | base64 | tr -d '\n')"
+    "${SSH[@]}" "echo $pw_b64 | base64 -d | sudo -S -p '' bash -c \"\$(echo $cmd_b64 | base64 -d)\""
 }
 
 run_remote() {
