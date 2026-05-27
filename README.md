@@ -4,7 +4,30 @@ A small, single-binary **solo-mining stratum server** in pure C11. It accepts
 miner connections on TCP `:3334`, builds block templates via `bitcoind`'s
 `getblocktemplate`, submits found blocks via `submitblock`, and records every
 accepted share into a local SQLite database. A separate Node.js dashboard
-reads a snapshot of that file for stats.
+reads that file for stats.
+
+## About Sidepool
+
+> Sidepool is a PPS (Pay-Per-Share) mining pool that pays out using
+> **Thunder**. We've released a solo-mining version alongside what we
+> believe will be a genuinely useful tool for miners.
+>
+> The current implementation of shares, calculations, and related
+> mechanics exists primarily to establish the **data model and
+> architecture** that will underpin the future PPS billing system.
+>
+> A share is simply your submission from the work you've been assigned —
+> it functions as a unit of account. From years of experience mining
+> with pools, we've observed that auditing your own contributions is
+> extremely difficult, often nearly impossible. Miners are forced to
+> trust the pool's reporting, with little ability to independently
+> verify what they're owed. Sidepool aims to address this transparency
+> gap. (Hopefully!)
+
+This repository is the **solo build** — every share lands in the local
+SQLite store, every accepted block is paid directly in its own coinbase,
+and there is no off-chain accounting. The PPS build will be a separate
+service that consumes the same data model; see the roadmap below.
 
 It is a **solo pool with direct payouts**: every coinbase has two outputs —
 the **miner who found the block gets the reward** (minus a small operator
@@ -241,4 +264,49 @@ src/
   cjson/             # vendored cJSON (MIT) — see src/cjson/README.md
 include/             # public headers (empty for now)
 tests/               # unit tests + integration shell script
+deploy/              # systemd unit templates + nginx vhost templates
+scripts/             # deploy + sync helpers
+dashboard/           # Node/Express read-only stats UI
 ```
+
+## Roadmap
+
+The solo build is intentionally minimal; the items below extend it
+toward the full Sidepool PPS pool without changing the share/block data
+model that already lives in `schema.sql`.
+
+1. **Move persistence behind Redis.** Add a Redis-backed write path
+   alongside the SQLite store so the hot share queue isn't bound to a
+   single-writer file. SQLite stays as the durable archive; Redis
+   absorbs the high-frequency writes and makes the share stream
+   consumable by other services in real time.
+2. **PPS billing as a separate, non-blocking service.** Run the
+   Pay-Per-Share build on its own port / instance. The billing engine
+   consumes the share stream (Redis) and settles payouts over
+   **Thunder**. Strict separation: a billing outage must never block
+   the stratum proxy from accepting work or submitting blocks.
+3. **Miner registration for the PPS pool.** Endpoint + flow for miners
+   to register a payout address, a withdrawal threshold, and any
+   per-account settings the PPS engine needs. The solo build doesn't
+   need this — solo miners are identified by the address embedded in
+   the stratum username — but PPS does.
+4. **Status and observability.** Expose Prometheus-style metrics
+   (`/metrics`), structured logs, and per-connection health for both
+   the proxy and the billing service. The goal is for any miner to be
+   able to audit their own contribution end to end without having to
+   trust an opaque "pool dashboard."
+5. **Richer dashboard metrics.** Build on the current overview / per-
+   worker / blocks pages with per-rig hashrate variance, expected-vs-
+   observed payouts, network-difficulty overlays, and historical
+   charts that go beyond the rolling 24-hour window.
+6. **Decouple the dashboard from the live database.** Have the
+   dashboard read its own derived store (a Redis replica or a periodic
+   materialised view) rather than the proxy's primary SQLite file.
+   That keeps the dashboard's read pattern from ever touching the hot
+   write path.
+
+## License
+
+simplepool is released under the **MIT License** (see [`LICENSE`](LICENSE)).
+The vendored cJSON code in `src/cjson/` is also MIT-licensed (see
+[`src/cjson/README.md`](src/cjson/README.md)).
