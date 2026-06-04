@@ -48,6 +48,40 @@ int coinbase_build_split(uint32_t height, int64_t value_sats,
                          int64_t *out_miner_sats, int64_t *out_fee_sats,
                          char *errbuf, size_t errlen);
 
+/* Build coinbase1/coinbase2 halves from a server-provided coinbase
+ * transaction (BIP22 "coinbasetxn", e.g. from the CUSF enforcer), rather
+ * than constructing the coinbase from scratch.
+ *
+ * `coinbase_tx_hex` is the full serialized coinbase tx (segwit or legacy).
+ * The builder:
+ *   - appends the extranonce placeholder to the existing scriptSig, after
+ *     the BIP34 height push the server already placed there;
+ *   - replaces the single spendable (non-OP_RETURN) output — which the
+ *     server pays to its own reward address — with the miner payout and an
+ *     optional operator-fee output (same split rule as coinbase_build_split);
+ *   - preserves every other output byte-for-byte and in order (BIP300/301
+ *     commitment OP_RETURNs and the segwit witness commitment).
+ *
+ * cb1/cb2 are the legacy (no-witness) serialization. *out_has_witness (if
+ * non-NULL) reports whether the source tx was segwit-serialized, so the
+ * caller can re-attach the witness reserved value when it assembles the
+ * block. *out_miner_sats / *out_fee_sats receive the split (may be NULL).
+ *
+ * `operator_address` / `coinbase_tag` may be NULL. Returns 0 ok, negative on
+ * error (errbuf populated). */
+int coinbase_build_from_template(const char *coinbase_tx_hex,
+                                 const char *miner_address,
+                                 const char *operator_address,
+                                 int fee_bps,
+                                 const char *coinbase_tag,
+                                 size_t extranonce1_size,
+                                 size_t extranonce2_size,
+                                 coinbase_parts_t *out,
+                                 int *out_has_witness,
+                                 int64_t *out_miner_sats,
+                                 int64_t *out_fee_sats,
+                                 char *errbuf, size_t errlen);
+
 void coinbase_parts_free(coinbase_parts_t *p);
 
 /* Internal helpers exposed for tests. */

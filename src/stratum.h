@@ -16,7 +16,13 @@ typedef struct stratum_job stratum_job_t;
  *   - en1_size / en2_size:  extranonce sizes, both currently 4
  *
  * tx_hex_list may be NULL if tx_count == 0. The job takes ownership of
- * its own heap copies; caller's buffers are not retained. */
+ * its own heap copies; caller's buffers are not retained.
+ *
+ * coinbasetxn_hex is optional (may be NULL): when the backend supplied a
+ * full coinbase (BIP22 "coinbasetxn"), each connection's coinbase is built
+ * from it instead of from scratch. coinbase_has_witness records whether that
+ * coinbase is segwit-serialized, so the block assembler re-attaches the
+ * witness reserved value at submit time. */
 stratum_job_t *stratum_job_new(
     const char *job_id,
     int32_t version,
@@ -28,7 +34,8 @@ stratum_job_t *stratum_job_new(
     uint32_t nbits, uint32_t ntime,
     const uint8_t network_target_be[32],
     uint32_t height,
-    const char *const *tx_hex_list, size_t tx_count);
+    const char *const *tx_hex_list, size_t tx_count,
+    const char *coinbasetxn_hex, int coinbase_has_witness);
 
 void stratum_job_free(stratum_job_t *j);
 

@@ -582,3 +582,244 @@ oom:
     set_err(errbuf, errlen, "out of memory");
     return -1;
 }
+
+/* ---------- coinbasetxn (server-provided coinbase) ---------- */
+
+/* Read a little-endian Bitcoin varint from buf[*off..len). Advances *off. */
+static int rd_varint(const uint8_t *buf, size_t len, size_t *off, uint64_t *val) {
+    if (*off >= len) return -1;
+    uint8_t b = buf[(*off)++];
+    if (b < 0xfd) { *val = b; return 0; }
+    size_t n = (b == 0xfd) ? 2 : (b == 0xfe) ? 4 : 8;
+    if (*off + n > len) return -1;
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++) v |= (uint64_t)buf[*off + i] << (8 * i);
+    *off += n;
+    *val = v;
+    return 0;
+}
+
+static int rd_u32(const uint8_t *buf, size_t len, size_t *off, uint32_t *val) {
+    if (*off + 4 > len) return -1;
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) v |= (uint32_t)buf[*off + i] << (8 * i);
+    *off += 4;
+    *val = v;
+    return 0;
+}
+
+static int rd_u64(const uint8_t *buf, size_t len, size_t *off, uint64_t *val) {
+    if (*off + 8 > len) return -1;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)buf[*off + i] << (8 * i);
+    *off += 8;
+    *val = v;
+    return 0;
+}
+
+int coinbase_build_from_template(const char *coinbase_tx_hex,
+                                 const char *miner_address,
+                                 const char *operator_address,
+                                 int fee_bps,
+                                 const char *coinbase_tag,
+                                 size_t extranonce1_size,
+                                 size_t extranonce2_size,
+                                 coinbase_parts_t *out,
+                                 int *out_has_witness,
+                                 int64_t *out_miner_sats,
+                                 int64_t *out_fee_sats,
+                                 char *errbuf, size_t errlen) {
+    if (!out || !coinbase_tx_hex || !miner_address) {
+        set_err(errbuf, errlen, "null arg");
+        return -1;
+    }
+    out->cb1 = NULL; out->cb1_len = 0;
+    out->cb2 = NULL; out->cb2_len = 0;
+    if (out_has_witness) *out_has_witness = 0;
+    if (out_miner_sats)  *out_miner_sats  = 0;
+    if (out_fee_sats)    *out_fee_sats    = 0;
+
+    struct cb_out { uint64_t value; size_t spk_off; size_t spk_len; int op_return; };
+
+    uint8_t *tx = NULL;
+    struct cb_out *outs = NULL;
+    bbuf_t c1, ob, c2;
+    bbuf_init(&c1); bbuf_init(&ob); bbuf_init(&c2);
+    int ret = -1;
+
+    /* Decode the coinbase tx hex into bytes. */
+    size_t hexlen = strlen(coinbase_tx_hex);
+    if (hexlen % 2 != 0) { set_err(errbuf, errlen, "odd coinbasetxn hex"); goto done; }
+    size_t txlen = hexlen / 2;
+    tx = (uint8_t *)malloc(txlen ? txlen : 1);
+    if (!tx) { set_err(errbuf, errlen, "oom"); goto done; }
+    size_t dl = 0;
+    if (hex_decode(coinbase_tx_hex, tx, txlen, &dl) < 0 || dl != txlen) {
+        set_err(errbuf, errlen, "bad coinbasetxn hex");
+        goto done;
+    }
+
+    /* Parse: version | [marker flag] | vin | input | vout | outputs |
+     *        [witness] | locktime. */
+    size_t off = 0;
+    uint32_t version;
+    if (rd_u32(tx, txlen, &off, &version) < 0) { set_err(errbuf, errlen, "truncated coinbasetxn"); goto done; }
+
+    int has_witness = 0;
+    if (off + 2 <= txlen && tx[off] == 0x00 && tx[off + 1] != 0x00) {
+        has_witness = 1;     /* segwit marker (0x00) + flag (nonzero) */
+        off += 2;
+    }
+
+    uint64_t vin = 0;
+    if (rd_varint(tx, txlen, &off, &vin) < 0) { set_err(errbuf, errlen, "truncated coinbasetxn"); goto done; }
+    if (vin != 1) { set_err(errbuf, errlen, "coinbasetxn input count %llu != 1", (unsigned long long)vin); goto done; }
+
+    size_t prevout_off = off;            /* 32-byte hash + 4-byte index */
+    if (off + 36 > txlen) { set_err(errbuf, errlen, "truncated coinbasetxn input"); goto done; }
+    off += 36;
+    uint64_t ss_len = 0;
+    if (rd_varint(tx, txlen, &off, &ss_len) < 0) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
+    size_t ss_off = off;
+    if (off + ss_len > txlen) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
+    off += ss_len;
+    uint32_t sequence;
+    if (rd_u32(tx, txlen, &off, &sequence) < 0) { set_err(errbuf, errlen, "truncated sequence"); goto done; }
+
+    uint64_t vout = 0;
+    if (rd_varint(tx, txlen, &off, &vout) < 0) { set_err(errbuf, errlen, "truncated output count"); goto done; }
+    if (vout == 0) { set_err(errbuf, errlen, "coinbasetxn has no outputs"); goto done; }
+
+    outs = (struct cb_out *)calloc((size_t)vout, sizeof(*outs));
+    if (!outs) { set_err(errbuf, errlen, "oom"); goto done; }
+
+    int64_t reward_idx = -1;
+    int reward_count = 0;
+    for (uint64_t i = 0; i < vout; i++) {
+        uint64_t val = 0, spk_len = 0;
+        if (rd_u64(tx, txlen, &off, &val) < 0) { set_err(errbuf, errlen, "truncated output value"); goto done; }
+        if (rd_varint(tx, txlen, &off, &spk_len) < 0) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
+        if (off + spk_len > txlen) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
+        outs[i].value = val;
+        outs[i].spk_off = off;
+        outs[i].spk_len = (size_t)spk_len;
+        outs[i].op_return = (spk_len >= 1 && tx[off] == 0x6a); /* OP_RETURN */
+        off += spk_len;
+        if (!outs[i].op_return) { reward_idx = (int64_t)i; reward_count++; }
+    }
+
+    /* Skip the input witness (single input) to reach the locktime. */
+    if (has_witness) {
+        uint64_t stack = 0;
+        if (rd_varint(tx, txlen, &off, &stack) < 0) { set_err(errbuf, errlen, "truncated witness"); goto done; }
+        for (uint64_t i = 0; i < stack; i++) {
+            uint64_t il = 0;
+            if (rd_varint(tx, txlen, &off, &il) < 0) { set_err(errbuf, errlen, "truncated witness item"); goto done; }
+            if (off + il > txlen) { set_err(errbuf, errlen, "truncated witness item"); goto done; }
+            off += il;
+        }
+    }
+
+    uint32_t locktime;
+    if (rd_u32(tx, txlen, &off, &locktime) < 0) { set_err(errbuf, errlen, "truncated locktime"); goto done; }
+    if (off != txlen) { set_err(errbuf, errlen, "coinbasetxn trailing bytes"); goto done; }
+
+    /* The server pays the reward to exactly one spendable output; we hand
+     * that value to the miner. Refuse to guess if that assumption breaks. */
+    if (reward_count != 1) {
+        set_err(errbuf, errlen, "coinbasetxn has %d spendable outputs (expected 1)", reward_count);
+        goto done;
+    }
+    int64_t reward = (int64_t)outs[reward_idx].value;
+
+    /* Resolve miner scriptPubKey + fee split (mirrors coinbase_build_split). */
+    uint8_t miner_spk[64]; size_t miner_spk_len = 0;
+    if (coinbase_address_to_script(miner_address, miner_spk, sizeof miner_spk,
+                                   &miner_spk_len, errbuf, errlen) < 0) goto done;
+
+    int64_t fee_sats = 0, miner_sats = reward;
+    uint8_t operator_spk[64]; size_t operator_spk_len = 0;
+    int has_operator = 0;
+    if (operator_address && operator_address[0] && fee_bps > 0 && reward > 0) {
+        fee_sats = (reward * (int64_t)fee_bps) / 10000;
+        if (fee_sats >= COINBASE_DUST_SATS) {
+            if (coinbase_address_to_script(operator_address, operator_spk,
+                                           sizeof operator_spk, &operator_spk_len,
+                                           errbuf, errlen) < 0) goto done;
+            miner_sats = reward - fee_sats;
+            has_operator = 1;
+        } else {
+            fee_sats = 0;
+        }
+    }
+
+    /* Optional coinbase tag, appended into the scriptSig. */
+    uint8_t tag_push[80]; size_t tag_push_len = 0;
+    if (coinbase_tag && *coinbase_tag) {
+        size_t tlen = strlen(coinbase_tag);
+        if (tlen > 75) tlen = 75;
+        tag_push[0] = (uint8_t)tlen;
+        memcpy(tag_push + 1, coinbase_tag, tlen);
+        tag_push_len = tlen + 1;
+    }
+
+    /* New scriptSig = server scriptSig (BIP34 height + any server data) +
+     * tag + extranonce placeholder. Coinbase scriptSig is capped at 100. */
+    size_t en_total = extranonce1_size + extranonce2_size;
+    uint64_t new_ss_len = ss_len + tag_push_len + en_total;
+    if (new_ss_len < 2 || new_ss_len > 100) {
+        set_err(errbuf, errlen, "coinbase scriptSig length %llu out of range",
+                (unsigned long long)new_ss_len);
+        goto done;
+    }
+
+    /* cb1: version | vin(1) | prevout(36) | varint(scriptSig_len) |
+     *      server scriptSig | tag   (extranonce slots follow). */
+    if (bbuf_push_u32_le(&c1, version) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push_varint(&c1, 1) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push(&c1, tx + prevout_off, 36) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push_varint(&c1, new_ss_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (ss_len && bbuf_push(&c1, tx + ss_off, (size_t)ss_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (tag_push_len && bbuf_push(&c1, tag_push, tag_push_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+
+    /* Outputs: replace the reward output, preserve everything else in order. */
+    uint64_t new_vout = vout + (has_operator ? 1u : 0u);
+    for (uint64_t i = 0; i < vout; i++) {
+        if ((int64_t)i == reward_idx) {
+            if (bbuf_push_u64_le(&ob, (uint64_t)miner_sats) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            if (bbuf_push_varint(&ob, miner_spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            if (bbuf_push(&ob, miner_spk, miner_spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            if (has_operator) {
+                if (bbuf_push_u64_le(&ob, (uint64_t)fee_sats) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+                if (bbuf_push_varint(&ob, operator_spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+                if (bbuf_push(&ob, operator_spk, operator_spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            }
+        } else {
+            if (bbuf_push_u64_le(&ob, outs[i].value) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            if (bbuf_push_varint(&ob, outs[i].spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            if (bbuf_push(&ob, tx + outs[i].spk_off, outs[i].spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+        }
+    }
+
+    /* cb2: sequence | varint(out_count) | outputs | locktime. */
+    if (bbuf_push_u32_le(&c2, sequence) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push_varint(&c2, new_vout) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push(&c2, ob.data, ob.len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push_u32_le(&c2, locktime) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+
+    /* Success — hand ownership of c1/c2 buffers to the caller. */
+    out->cb1 = c1.data; out->cb1_len = c1.len; c1.data = NULL;
+    out->cb2 = c2.data; out->cb2_len = c2.len; c2.data = NULL;
+    if (out_has_witness) *out_has_witness = has_witness;
+    if (out_miner_sats)  *out_miner_sats  = miner_sats;
+    if (out_fee_sats)    *out_fee_sats    = fee_sats;
+    ret = 0;
+
+done:
+    bbuf_free(&c1);
+    bbuf_free(&ob);
+    bbuf_free(&c2);
+    free(outs);
+    free(tx);
+    return ret;
+}
