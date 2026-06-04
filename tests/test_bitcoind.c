@@ -85,6 +85,55 @@ static void test_parse_ok(void) {
     cJSON_Delete(root);
 }
 
+/* Backends like the CUSF enforcer return a server-built coinbase under
+ * "coinbasetxn" (no "coinbasevalue"). The coinbase's total output value is
+ * reported as a negative "fee"; the parser stores the raw tx hex and recovers
+ * the value by negating that fee. */
+static const char *SAMPLE_GBT_COINBASETXN =
+"{"
+"  \"version\": 536870912,"
+"  \"previousblockhash\": \"0000000000000000000a1b2c3d4e5f6789abcdef0123456789abcdef01234567\","
+"  \"transactions\": [],"
+"  \"coinbaseaux\": {},"
+"  \"coinbasetxn\": {"
+"    \"data\": \"02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff04025c0bffffffff0100f2052a01000000160014000000000000000000000000000000000000000000000000\","
+"    \"txid\": \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\","
+"    \"hash\": \"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899\","
+"    \"depends\": [],"
+"    \"fee\": -5000000000,"
+"    \"sigops\": 0,"
+"    \"weight\": 400"
+"  },"
+"  \"target\": \"0000000000000000000a000000000000000000000000000000000000000000ff\","
+"  \"mintime\": 1700000000,"
+"  \"noncerange\": \"00000000ffffffff\","
+"  \"curtime\": 1700001234,"
+"  \"bits\": \"170abc12\","
+"  \"height\": 800123,"
+"  \"default_witness_commitment\": \"6a24aa21a9ed0000000000000000000000000000000000000000000000000000000000000000\""
+"}";
+
+static void test_parse_coinbasetxn(void) {
+    cJSON *root = cJSON_Parse(SAMPLE_GBT_COINBASETXN);
+    assert(root);
+    bitcoind_template_t *t = NULL;
+    char err[256] = {0};
+    int rc = bitcoind_parse_template(root, &t, err, sizeof(err));
+    CHECK(rc == 0);
+    CHECK(t != NULL);
+    if (t) {
+        CHECK(t->height == 800123);
+        /* value derived by negating the coinbasetxn "fee" */
+        CHECK(t->coinbase_value_sats == 5000000000LL);
+        CHECK(t->coinbasetxn_hex != NULL);
+        CHECK(t->coinbasetxn_hex != NULL &&
+              strncmp(t->coinbasetxn_hex, "02000000", 8) == 0);
+        CHECK(t->bits == 0x170abc12u);
+    }
+    bitcoind_template_free(t);
+    cJSON_Delete(root);
+}
+
 static void test_parse_missing_prevhash(void) {
     const char *bad =
         "{ \"version\":1, \"coinbasevalue\":100, \"target\":\"00\","
@@ -154,6 +203,7 @@ static void test_client_init_validates(void) {
 
 int main(void) {
     test_parse_ok();
+    test_parse_coinbasetxn();
     test_parse_missing_prevhash();
     test_parse_empty_txs();
     test_double_free_safe();

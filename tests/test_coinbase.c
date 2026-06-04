@@ -261,6 +261,162 @@ static void test_bip34_small_height_uses_opn(void) {
     printf("ok: bip34 small-height uses OP_N\n");
 }
 
+/* A server-built coinbase like the CUSF enforcer returns: segwit-serialized,
+ * version 2, scriptSig = BIP34 height push for 800000 only, three outputs —
+ * a BIP301 commitment OP_RETURN, the spendable reward (50 BTC), and the segwit
+ * witness commitment — plus a single 32-byte (all-zero) input witness. */
+static const char *ENF_COINBASE_HEX =
+    "02000000"                                                            /* version 2 */
+    "0001"                                                                /* segwit marker + flag */
+    "01"                                                                  /* vin = 1 */
+    "0000000000000000000000000000000000000000000000000000000000000000"    /* prevout hash */
+    "ffffffff"                                                            /* prevout index */
+    "04" "0300350c"                                                       /* scriptSig: height 800000 */
+    "ffffffff"                                                            /* sequence */
+    "03"                                                                  /* vout = 3 */
+    "0000000000000000" "06" "6a04deadbeef"                                /* out0: BIP301 commitment */
+    "00f2052a01000000" "16" "0014" "1111111111111111111111111111111111111111" /* out1: reward 50 BTC */
+    "0000000000000000" "26" "6a24aa21a9ed"
+        "2222222222222222222222222222222222222222222222222222222222222222"    /* out2: witness commitment */
+    "0120" "0000000000000000000000000000000000000000000000000000000000000000" /* input witness */
+    "00000000";                                                           /* locktime */
+
+#define ENF_ADDR "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
+
+/* Rebuild from a server-provided coinbase: the reward output is redirected to
+ * the miner, the extranonce is spliced into the scriptSig, and the mandatory
+ * commitment + witness-commitment outputs are preserved verbatim. */
+static void test_build_from_template(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    int has_witness = -1;
+    int64_t miner_sats = 0, fee_sats = 0;
+
+    int rc = coinbase_build_from_template(
+        ENF_COINBASE_HEX, ENF_ADDR, NULL, 0, "/x/", 4, 4,
+        &parts, &has_witness, &miner_sats, &fee_sats, err, sizeof err);
+    if (rc != 0) fprintf(stderr, "build_from_template err: %s\n", err);
+    assert(rc == 0);
+    assert(has_witness == 1);
+    assert(miner_sats == 5000000000LL);
+    assert(fee_sats == 0);
+
+    size_t total = parts.cb1_len + 8 + parts.cb2_len;
+    uint8_t *tx = (uint8_t *)malloc(total);
+    assert(tx);
+    memcpy(tx, parts.cb1, parts.cb1_len);
+    memset(tx + parts.cb1_len, 0xaa, 4);       /* extranonce1 */
+    memset(tx + parts.cb1_len + 4, 0xbb, 4);   /* extranonce2 */
+    memcpy(tx + parts.cb1_len + 8, parts.cb2, parts.cb2_len);
+
+    size_t off = 0;
+    uint32_t version = 0;
+    for (int i = 0; i < 4; i++) version |= (uint32_t)tx[off + i] << (8 * i);
+    off += 4;
+    assert(version == 2); /* preserved from the template, not forced to 1 */
+
+    uint64_t in_count = 0;
+    assert(read_varint(tx, total, &off, &in_count) == 0);
+    assert(in_count == 1);
+    for (int i = 0; i < 32; i++) assert(tx[off + i] == 0);
+    off += 32;
+    for (int i = 0; i < 4; i++) assert(tx[off + i] == 0xff);
+    off += 4;
+
+    uint64_t ss_len = 0;
+    assert(read_varint(tx, total, &off, &ss_len) == 0);
+    assert(ss_len == 4 + 4 + 8); /* height(4) + tag "/x/"(4) + extranonce(8) */
+    assert(tx[off] == 0x03 && tx[off + 1] == 0x00 &&
+           tx[off + 2] == 0x35 && tx[off + 3] == 0x0c);     /* BIP34 height kept */
+    assert(tx[off + 4] == 0x03 && tx[off + 5] == '/' &&
+           tx[off + 6] == 'x' && tx[off + 7] == '/');       /* tag push */
+    assert(tx[off + 8] == 0xaa && tx[off + 11] == 0xaa);    /* extranonce1 */
+    assert(tx[off + 12] == 0xbb && tx[off + 15] == 0xbb);   /* extranonce2 */
+    off += ss_len;
+
+    for (int i = 0; i < 4; i++) assert(tx[off + i] == 0xff); /* sequence */
+    off += 4;
+
+    uint64_t out_count = 0;
+    assert(read_varint(tx, total, &off, &out_count) == 0);
+    assert(out_count == 3); /* commitment + redirected reward + witness commitment */
+
+    /* out0: BIP301 commitment preserved. */
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 0);
+    uint64_t l = 0;
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 6 && tx[off] == 0x6a && tx[off + 1] == 0x04);
+    off += l;
+
+    /* out1: reward redirected to the miner (50 BTC, 22-byte P2WPKH). */
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 5000000000ULL);
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 22 && tx[off] == 0x00 && tx[off + 1] == 0x14);
+    off += l;
+
+    /* out2: witness commitment preserved. */
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 0);
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 38 && tx[off] == 0x6a && tx[off + 1] == 0x24);
+    off += l;
+
+    for (int i = 0; i < 4; i++) assert(tx[off + i] == 0); /* locktime */
+    off += 4;
+    assert(off == total);
+
+    free(tx);
+    coinbase_parts_free(&parts);
+    printf("ok: coinbase_build_from_template (redirect + preserve commitments)\n");
+}
+
+/* With an operator fee, a fourth output (the operator payout) is inserted and
+ * the reward is split, while the commitments are still preserved. */
+static void test_build_from_template_fee_split(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    int has_witness = 0;
+    int64_t miner_sats = 0, fee_sats = 0;
+
+    int rc = coinbase_build_from_template(
+        ENF_COINBASE_HEX, ENF_ADDR, ENF_ADDR, 100, "/x/", 4, 4,
+        &parts, &has_witness, &miner_sats, &fee_sats, err, sizeof err);
+    assert(rc == 0);
+    assert(fee_sats == 50000000LL);       /* 1% of 50 BTC */
+    assert(miner_sats == 4950000000LL);
+
+    size_t total = parts.cb1_len + 8 + parts.cb2_len;
+    uint8_t *tx = (uint8_t *)malloc(total);
+    assert(tx);
+    memcpy(tx, parts.cb1, parts.cb1_len);
+    memset(tx + parts.cb1_len, 0xaa, 4);
+    memset(tx + parts.cb1_len + 4, 0xbb, 4);
+    memcpy(tx + parts.cb1_len + 8, parts.cb2, parts.cb2_len);
+
+    size_t off = 4;
+    uint64_t in_count = 0;
+    assert(read_varint(tx, total, &off, &in_count) == 0);
+    off += 36;
+    uint64_t ss_len = 0;
+    assert(read_varint(tx, total, &off, &ss_len) == 0);
+    off += ss_len + 4;
+    uint64_t out_count = 0;
+    assert(read_varint(tx, total, &off, &out_count) == 0);
+    assert(out_count == 4); /* commitment + miner + operator + witness commitment */
+
+    free(tx);
+    coinbase_parts_free(&parts);
+    printf("ok: coinbase_build_from_template fee split\n");
+}
+
 int main(void) {
     test_p2pkh_address();
     test_p2wpkh_address();
@@ -268,6 +424,8 @@ int main(void) {
     test_build_coinbase_structural();
     test_build_coinbase_split_fee_math();
     test_bip34_small_height_uses_opn();
+    test_build_from_template();
+    test_build_from_template_fee_split();
     printf("test_coinbase: all tests passed\n");
     return 0;
 }
