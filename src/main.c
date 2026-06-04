@@ -385,12 +385,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "bitcoind_client_init failed\n");
         return 3;
     }
-    if (bitcoind_ping(&btc, err, sizeof err) < 0) {
-        fprintf(stderr, "bitcoind ping failed: %s\n", err);
-        bitcoind_client_free(&btc);
-        return 3;
+    /* The ping is a getblockchaininfo sanity check. Some block-template
+     * backends that accept unauthenticated JSON-RPC don't implement it, so
+     * skip the ping when no credentials are configured — the initial
+     * getblocktemplate below still validates connectivity. */
+    if (cfg.bitcoind_user[0] != '\0' || cfg.bitcoind_pass[0] != '\0') {
+        if (bitcoind_ping(&btc, err, sizeof err) < 0) {
+            fprintf(stderr, "bitcoind ping failed: %s\n", err);
+            bitcoind_client_free(&btc);
+            return 3;
+        }
+        LOG_INFO("bitcoind ping ok");
+    } else {
+        LOG_INFO("bitcoind: no RPC credentials configured, "
+                 "skipping getblockchaininfo ping");
     }
-    LOG_INFO("bitcoind ping ok");
 
     /* Store. */
     store_cfg_t scfg = {0};
