@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "bitcoind.h"
 #include "cjson/cJSON.h"
+#include "log.h"
 
 #include <curl/curl.h>
 #include <pthread.h>
@@ -122,6 +123,8 @@ static int rpc_call(bitcoind_client_t *c,
         return -3;
     }
 
+    LOG_DEBUG("bitcoind rpc -> %s %s: %s", c->cfg.url, method, body);
+
     pthread_mutex_t *m = (pthread_mutex_t *)c->_lock;
     pthread_mutex_lock(m);
 
@@ -133,17 +136,24 @@ static int rpc_call(bitcoind_client_t *c,
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
-    char userpwd[128 + 256 + 2];
-    snprintf(userpwd, sizeof(userpwd), "%s:%s", c->cfg.user, c->cfg.pass);
-
     curl_easy_reset(cu);
     curl_easy_setopt(cu, CURLOPT_URL, c->cfg.url);
     curl_easy_setopt(cu, CURLOPT_POST, 1L);
     curl_easy_setopt(cu, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(cu, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
     curl_easy_setopt(cu, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(cu, CURLOPT_USERPWD, userpwd);
-    curl_easy_setopt(cu, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
+
+    /* Some block-template backends (e.g. a stock bitcoind reachable over a
+     * trusted socket) accept unauthenticated JSON-RPC. When neither user nor
+     * pass is configured we omit the credentials entirely rather than sending
+     * an empty "user:pass" basic-auth header. */
+    char userpwd[128 + 256 + 2];
+    if (c->cfg.user[0] != '\0' || c->cfg.pass[0] != '\0') {
+        snprintf(userpwd, sizeof(userpwd), "%s:%s", c->cfg.user, c->cfg.pass);
+        curl_easy_setopt(cu, CURLOPT_USERPWD, userpwd);
+        curl_easy_setopt(cu, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
+    }
+
     curl_easy_setopt(cu, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(cu, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(cu, CURLOPT_TIMEOUT_MS, c->cfg.timeout_ms);
@@ -156,6 +166,11 @@ static int rpc_call(bitcoind_client_t *c,
     curl_slist_free_all(headers);
     free(body);
     pthread_mutex_unlock(m);
+
+    if (rc == CURLE_OK) {
+        LOG_DEBUG("bitcoind rpc <- %s (http %ld): %s", method, http_code,
+                  resp.buf ? resp.buf : "");
+    }
 
     if (rc != CURLE_OK) {
         set_err(errbuf, errlen, "curl: %s", curl_easy_strerror(rc));
