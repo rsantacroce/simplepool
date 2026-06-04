@@ -309,6 +309,11 @@ the miner). If the computed fee would be below the relay dust threshold
 (~546 sats) the operator output is dropped automatically and the miner
 gets the full reward.
 
+`bitcoind_user` / `bitcoind_pass` are optional: omit both for a
+block-template backend that accepts unauthenticated JSON-RPC, and the
+proxy issues the RPC call without a basic-auth header. Set
+`log_level = debug` to log every RPC request and raw response.
+
 ## How shares are credited
 
 One accepted share = one row in the `shares` table, tagged with the
