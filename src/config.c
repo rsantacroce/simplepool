@@ -26,8 +26,11 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->initial_diff = 1.0;
 
     snprintf(cfg->bitcoind_url,  sizeof cfg->bitcoind_url,  "%s", "http://127.0.0.1:18443");
-    snprintf(cfg->bitcoind_user, sizeof cfg->bitcoind_user, "%s", "drivepool");
-    snprintf(cfg->bitcoind_pass, sizeof cfg->bitcoind_pass, "%s", "drivepool");
+    /* No default credentials: when bitcoind_user/bitcoind_pass are omitted the
+     * RPC client connects without basic auth (for backends that don't require
+     * it). memset above already leaves both as empty strings. */
+    cfg->bitcoind_user[0] = '\0';
+    cfg->bitcoind_pass[0] = '\0';
     cfg->bitcoind_poll_interval_ms = 30000;
 
     cfg->operator_address[0] = '\0';

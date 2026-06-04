@@ -2,6 +2,10 @@ listen_addr = 0.0.0.0
 listen_port = 3334
 
 bitcoind_url = http://127.0.0.1:18443
+# bitcoind_user / bitcoind_pass are optional. Omit BOTH for a block-template
+# backend that doesn't require authentication; the RPC call is then made
+# without a basic-auth header. Set them for a stock bitcoind using rpcuser/
+# rpcpassword (cookie auth is not supported).
 bitcoind_user = drivepool
 bitcoind_pass = drivepool
 bitcoind_poll_interval_ms = 30000

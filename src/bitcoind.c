@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "bitcoind.h"
 #include "cjson/cJSON.h"
+#include "log.h"
 
 #include <curl/curl.h>
 #include <pthread.h>
@@ -106,7 +107,9 @@ static int rpc_call(bitcoind_client_t *c,
         set_err(errbuf, errlen, "oom");
         return -2;
     }
-    cJSON_AddStringToObject(req, "jsonrpc", "1.0");
+    /* JSON-RPC 2.0: bitcoind accepts both, but strict servers (e.g. the CUSF
+     * enforcer, built on jsonrpsee) reject 1.0 requests outright. */
+    cJSON_AddStringToObject(req, "jsonrpc", "2.0");
     cJSON_AddStringToObject(req, "id", "proxy");
     cJSON_AddStringToObject(req, "method", method);
     if (params) {
@@ -122,6 +125,8 @@ static int rpc_call(bitcoind_client_t *c,
         return -3;
     }
 
+    LOG_DEBUG("bitcoind rpc -> %s %s: %s", c->cfg.url, method, body);
+
     pthread_mutex_t *m = (pthread_mutex_t *)c->_lock;
     pthread_mutex_lock(m);
 
@@ -133,17 +138,24 @@ static int rpc_call(bitcoind_client_t *c,
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
-    char userpwd[128 + 256 + 2];
-    snprintf(userpwd, sizeof(userpwd), "%s:%s", c->cfg.user, c->cfg.pass);
-
     curl_easy_reset(cu);
     curl_easy_setopt(cu, CURLOPT_URL, c->cfg.url);
     curl_easy_setopt(cu, CURLOPT_POST, 1L);
     curl_easy_setopt(cu, CURLOPT_POSTFIELDS, body);
     curl_easy_setopt(cu, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
     curl_easy_setopt(cu, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(cu, CURLOPT_USERPWD, userpwd);
-    curl_easy_setopt(cu, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
+
+    /* Some block-template backends (e.g. a stock bitcoind reachable over a
+     * trusted socket) accept unauthenticated JSON-RPC. When neither user nor
+     * pass is configured we omit the credentials entirely rather than sending
+     * an empty "user:pass" basic-auth header. */
+    char userpwd[128 + 256 + 2];
+    if (c->cfg.user[0] != '\0' || c->cfg.pass[0] != '\0') {
+        snprintf(userpwd, sizeof(userpwd), "%s:%s", c->cfg.user, c->cfg.pass);
+        curl_easy_setopt(cu, CURLOPT_USERPWD, userpwd);
+        curl_easy_setopt(cu, CURLOPT_HTTPAUTH, (long)CURLAUTH_BASIC);
+    }
+
     curl_easy_setopt(cu, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(cu, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(cu, CURLOPT_TIMEOUT_MS, c->cfg.timeout_ms);
@@ -156,6 +168,11 @@ static int rpc_call(bitcoind_client_t *c,
     curl_slist_free_all(headers);
     free(body);
     pthread_mutex_unlock(m);
+
+    if (rc == CURLE_OK) {
+        LOG_DEBUG("bitcoind rpc <- %s (http %ld): %s", method, http_code,
+                  resp.buf ? resp.buf : "");
+    }
 
     if (rc != CURLE_OK) {
         set_err(errbuf, errlen, "curl: %s", curl_easy_strerror(rc));
@@ -244,6 +261,7 @@ int bitcoind_parse_template(void *result_json,
     cJSON *jh = cJSON_GetObjectItemCaseSensitive(r, "height");
     cJSON *jp = cJSON_GetObjectItemCaseSensitive(r, "previousblockhash");
     cJSON *jc = cJSON_GetObjectItemCaseSensitive(r, "coinbasevalue");
+    cJSON *jcbtxn = cJSON_GetObjectItemCaseSensitive(r, "coinbasetxn");
     cJSON *jt = cJSON_GetObjectItemCaseSensitive(r, "target");
     cJSON *jb = cJSON_GetObjectItemCaseSensitive(r, "bits");
     cJSON *jct = cJSON_GetObjectItemCaseSensitive(r, "curtime");
@@ -254,7 +272,11 @@ int bitcoind_parse_template(void *result_json,
 
     if (!cJSON_IsNumber(jh))               { set_err(errbuf, errlen, "missing height");            return -3;  }
     if (!cJSON_IsString(jp) || !jp->valuestring) { set_err(errbuf, errlen, "missing previousblockhash"); return -4; }
-    if (!cJSON_IsNumber(jc))               { set_err(errbuf, errlen, "missing coinbasevalue");     return -5;  }
+    /* The reward arrives as either "coinbasevalue" (we build the coinbase) or
+     * "coinbasetxn" (server-provided coinbase); require at least one. */
+    int has_value = cJSON_IsNumber(jc);
+    int has_cbtxn = cJSON_IsObject(jcbtxn);
+    if (!has_value && !has_cbtxn) { set_err(errbuf, errlen, "missing coinbasevalue/coinbasetxn"); return -5; }
     if (!cJSON_IsString(jt) || !jt->valuestring) { set_err(errbuf, errlen, "missing target");      return -6;  }
     if (!cJSON_IsString(jb) || !jb->valuestring) { set_err(errbuf, errlen, "missing bits");        return -7;  }
     if (!cJSON_IsNumber(jct))              { set_err(errbuf, errlen, "missing curtime");           return -8;  }
@@ -265,12 +287,28 @@ int bitcoind_parse_template(void *result_json,
 
     t->height = (int)jh->valuedouble;
     copy_hex64(t->prev_hash_hex, jp->valuestring);
-    t->coinbase_value_sats = (int64_t)jc->valuedouble;
     copy_hex64(t->target_hex, jt->valuestring);
+
+    if (has_value) {
+        t->coinbase_value_sats = (int64_t)jc->valuedouble;
+    } else {
+        /* coinbasetxn: keep the raw coinbase hex; the value is reported as a
+         * negative "fee" (fee = -sum(coinbase outputs)), so negate it. */
+        cJSON *jdata = cJSON_GetObjectItemCaseSensitive(jcbtxn, "data");
+        cJSON *jfee  = cJSON_GetObjectItemCaseSensitive(jcbtxn, "fee");
+        if (!cJSON_IsString(jdata) || !jdata->valuestring) {
+            set_err(errbuf, errlen, "coinbasetxn missing data");
+            free(t);
+            return -11;
+        }
+        t->coinbasetxn_hex = strdup(jdata->valuestring);
+        if (!t->coinbasetxn_hex) { set_err(errbuf, errlen, "oom"); free(t); return -12; }
+        t->coinbase_value_sats = cJSON_IsNumber(jfee) ? (int64_t)(-jfee->valuedouble) : 0;
+    }
 
     if (hex_to_u32(jb->valuestring, &t->bits) != 0) {
         set_err(errbuf, errlen, "bad bits hex");
-        free(t);
+        bitcoind_template_free(t);
         return -10;
     }
     t->curtime = (uint32_t)jct->valuedouble;
@@ -281,7 +319,7 @@ int bitcoind_parse_template(void *result_json,
         t->default_witness_commitment = strdup(jdwc->valuestring);
         if (!t->default_witness_commitment) {
             set_err(errbuf, errlen, "oom");
-            free(t);
+            bitcoind_template_free(t);
             return -21;
         }
     }
@@ -292,8 +330,7 @@ int bitcoind_parse_template(void *result_json,
             t->txs = (bitcoind_template_tx_t *)calloc((size_t)n, sizeof(*t->txs));
             if (!t->txs) {
                 set_err(errbuf, errlen, "oom");
-                free(t->default_witness_commitment);
-                free(t);
+                bitcoind_template_free(t);
                 return -22;
             }
             for (int i = 0; i < n; i++) {
@@ -335,12 +372,20 @@ int bitcoind_get_block_template(bitcoind_client_t *c,
     if (!out) return -1;
     *out = NULL;
 
-    /* params: [{"rules":["segwit"]}] */
+    /* params: [{"rules":["segwit"],"capabilities":["coinbasetxn"]}]
+     *
+     * Requesting the "coinbasetxn" capability is harmless against Bitcoin Core
+     * (it ignores it and still returns "coinbasevalue"), but tells backends
+     * that can dictate the coinbase — notably the CUSF enforcer — to hand us a
+     * fully built coinbase carrying the mandatory BIP300/301 commitments. */
     cJSON *params = cJSON_CreateArray();
     cJSON *obj = cJSON_CreateObject();
     cJSON *rules = cJSON_CreateArray();
     cJSON_AddItemToArray(rules, cJSON_CreateString("segwit"));
     cJSON_AddItemToObject(obj, "rules", rules);
+    cJSON *caps = cJSON_CreateArray();
+    cJSON_AddItemToArray(caps, cJSON_CreateString("coinbasetxn"));
+    cJSON_AddItemToObject(obj, "capabilities", caps);
     cJSON_AddItemToArray(params, obj);
 
     cJSON *result = NULL;
@@ -384,5 +429,6 @@ void bitcoind_template_free(bitcoind_template_t *t) {
         free(t->txs);
     }
     free(t->default_witness_commitment);
+    free(t->coinbasetxn_hex);
     free(t);
 }

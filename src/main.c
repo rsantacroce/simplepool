@@ -191,6 +191,16 @@ static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
     char job_id[32];
     snprintf(job_id, sizeof job_id, "%llx", (unsigned long long)now_ms());
 
+    /* A server-provided coinbase (BIP22 "coinbasetxn") is segwit-serialized
+     * when its version (4 bytes = 8 hex chars) is followed by the segwit
+     * marker 0x00 + flag 0x01. The CUSF enforcer uses this canonical form on
+     * every network except signet (where no witness commitment is added). */
+    int cb_has_witness = 0;
+    if (t->coinbasetxn_hex && strlen(t->coinbasetxn_hex) >= 12) {
+        const char *h = t->coinbasetxn_hex;
+        cb_has_witness = (h[8] == '0' && h[9] == '0' && h[10] == '0' && h[11] == '1');
+    }
+
     stratum_job_t *job = stratum_job_new(
         job_id, t->version, prev_le,
         t->coinbase_value_sats,
@@ -199,7 +209,8 @@ static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
         (const uint8_t (*)[32])branches, branch_count,
         t->bits, t->curtime, target_be,
         (uint32_t)t->height,
-        (const char *const *)tx_hex_list, t->tx_count);
+        (const char *const *)tx_hex_list, t->tx_count,
+        t->coinbasetxn_hex, cb_has_witness);
 
     /* stratum_job_new copies; free our originals. */
     free(branches);
@@ -385,12 +396,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "bitcoind_client_init failed\n");
         return 3;
     }
-    if (bitcoind_ping(&btc, err, sizeof err) < 0) {
-        fprintf(stderr, "bitcoind ping failed: %s\n", err);
-        bitcoind_client_free(&btc);
-        return 3;
+    /* The ping is a getblockchaininfo sanity check. Some block-template
+     * backends that accept unauthenticated JSON-RPC don't implement it, so
+     * skip the ping when no credentials are configured — the initial
+     * getblocktemplate below still validates connectivity. */
+    if (cfg.bitcoind_user[0] != '\0' || cfg.bitcoind_pass[0] != '\0') {
+        if (bitcoind_ping(&btc, err, sizeof err) < 0) {
+            fprintf(stderr, "bitcoind ping failed: %s\n", err);
+            bitcoind_client_free(&btc);
+            return 3;
+        }
+        LOG_INFO("bitcoind ping ok");
+    } else {
+        LOG_INFO("bitcoind: no RPC credentials configured, "
+                 "skipping getblockchaininfo ping");
     }
-    LOG_INFO("bitcoind ping ok");
 
     /* Store. */
     store_cfg_t scfg = {0};

@@ -36,6 +36,12 @@ typedef struct {
     int32_t version;
     char *default_witness_commitment; /* owned, may be NULL */
     int64_t min_time;
+    /* Server-provided coinbase (BIP22 "coinbasetxn"), as full serialized tx
+     * hex. NULL when the server returns "coinbasevalue" and we build our own
+     * coinbase. Set by backends like the CUSF enforcer that must dictate the
+     * coinbase (mandatory BIP300/301 commitments). When set,
+     * coinbase_value_sats is derived from the tx's total output value. */
+    char *coinbasetxn_hex;            /* owned, may be NULL */
     bitcoind_template_tx_t *txs;       /* owned array */
     size_t tx_count;
 } bitcoind_template_t;

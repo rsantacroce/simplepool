@@ -71,7 +71,9 @@ static stratum_job_t *make_test_job(const char *job_id,
                            /*wc_hex*/ NULL,
                            /*en1*/ 4, /*en2*/ 4,
                            NULL, 0, 0x1d00ffffu, 0x60000000u,
-                           network_target_be, 800000, NULL, 0);
+                           network_target_be, 800000, NULL, 0,
+                           /*coinbasetxn_hex*/ NULL,
+                           /*coinbase_has_witness*/ 0);
 }
 
 static void test_subscribe(void) {

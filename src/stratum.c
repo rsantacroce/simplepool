@@ -59,6 +59,12 @@ struct stratum_job {
     /* Template-level inputs for per-connection coinbase rendering. */
     int64_t  value_sats;
     char    *wc_hex;          /* witness commitment hex, owned, may be NULL */
+    /* Server-provided coinbase (BIP22 "coinbasetxn"), owned, may be NULL. When
+     * set, the per-connection coinbase is built from this rather than from
+     * scratch; coinbase_has_witness says whether to re-attach the witness
+     * reserved value when assembling a found block. */
+    char    *coinbasetxn_hex;
+    int      coinbase_has_witness;
     size_t   en1_size;
     size_t   en2_size;
 
@@ -86,7 +92,8 @@ stratum_job_t *stratum_job_new(
     uint32_t nbits, uint32_t ntime,
     const uint8_t network_target_be[32],
     uint32_t height,
-    const char *const *tx_hex_list, size_t tx_count)
+    const char *const *tx_hex_list, size_t tx_count,
+    const char *coinbasetxn_hex, int coinbase_has_witness)
 {
     stratum_job_t *j = calloc(1, sizeof(*j));
     if (!j) return NULL;
@@ -96,9 +103,14 @@ stratum_job_t *stratum_job_new(
     j->value_sats = value_sats;
     j->en1_size   = en1_size;
     j->en2_size   = en2_size;
+    j->coinbase_has_witness = coinbase_has_witness;
     if (witness_commitment_hex && *witness_commitment_hex) {
         j->wc_hex = strdup(witness_commitment_hex);
         if (!j->wc_hex) goto fail;
+    }
+    if (coinbasetxn_hex && *coinbasetxn_hex) {
+        j->coinbasetxn_hex = strdup(coinbasetxn_hex);
+        if (!j->coinbasetxn_hex) goto fail;
     }
     if (branch_count) {
         j->merkle_branches = calloc(branch_count, sizeof(*j->merkle_branches));
@@ -131,6 +143,7 @@ fail:
 void stratum_job_free(stratum_job_t *j) {
     if (!j) return;
     free(j->wc_hex);
+    free(j->coinbasetxn_hex);
     free(j->merkle_branches);
     if (j->tx_hex_list) {
         for (size_t i = 0; i < j->tx_count; ++i) free(j->tx_hex_list[i]);
@@ -443,12 +456,26 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
     }
     coinbase_parts_t parts = {0};
     char err[256] = {0};
-    int rc = coinbase_build_split(job->height, job->value_sats,
+    int rc;
+    if (job->coinbasetxn_hex) {
+        /* Backend dictated the coinbase (e.g. CUSF enforcer): build from it,
+         * redirecting the reward output to this miner and preserving the
+         * mandatory commitment outputs. The witness commitment is already in
+         * the server's coinbase, so job->wc_hex is not used here. */
+        rc = coinbase_build_from_template(job->coinbasetxn_hex,
+                                          c->payout_address,
+                                          s->cfg.operator_address, s->cfg.fee_bps,
+                                          s->cfg.coinbase_tag,
+                                          job->en1_size, job->en2_size,
+                                          &parts, NULL, NULL, NULL, err, sizeof err);
+    } else {
+        rc = coinbase_build_split(job->height, job->value_sats,
                                   c->payout_address,
                                   s->cfg.operator_address, s->cfg.fee_bps,
                                   job->wc_hex, s->cfg.coinbase_tag,
                                   job->en1_size, job->en2_size,
                                   &parts, NULL, NULL, err, sizeof err);
+    }
     if (rc < 0) {
         LOG_WARN("stratum: coinbase render failed for %s: %s",
                  c->worker_name, err);
@@ -778,7 +805,24 @@ static char *assemble_block_hex(const stratum_job_t *j,
     size_t cap = 0, len = 0;
     bytes_append(&block, &cap, &len, header, 80);
     varint_append(&block, &cap, &len, tx_count);
-    bytes_append(&block, &cap, &len, coinbase_tx, cb_len);
+    if (j->coinbase_has_witness && cb_len >= 8) {
+        /* coinbase_tx is the legacy serialization:
+         *   version(4) | inputs | outputs | locktime(4)
+         * The block's coinbase must carry its witness so the segwit
+         * commitment validates. Re-serialize in segwit form: insert the
+         * marker+flag after the version and the single-input witness (one
+         * 32-byte reserved value, all zero — matching the commitment the
+         * backend computed) just before the locktime. */
+        static const uint8_t marker_flag[2] = { 0x00, 0x01 };
+        static const uint8_t witness[34]    = { 0x01, 0x20 }; /* 1 item, 32 bytes, all zero */
+        bytes_append(&block, &cap, &len, coinbase_tx, 4);                 /* version */
+        bytes_append(&block, &cap, &len, marker_flag, 2);
+        bytes_append(&block, &cap, &len, coinbase_tx + 4, cb_len - 8);    /* inputs + outputs */
+        bytes_append(&block, &cap, &len, witness, sizeof witness);
+        bytes_append(&block, &cap, &len, coinbase_tx + cb_len - 4, 4);    /* locktime */
+    } else {
+        bytes_append(&block, &cap, &len, coinbase_tx, cb_len);
+    }
     for (size_t i = 0; i < j->tx_count; ++i) {
         size_t txn = 0;
         uint8_t *txb = hex_to_bytes_alloc(j->tx_hex_list[i], &txn);
