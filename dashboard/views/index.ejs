@@ -32,6 +32,60 @@ const ago = (t) => {
             </div>
         <% } %>
 
+        <% if (pool && pool.public) { %>
+        <section class="card info">
+            <h2>Welcome — point your miner here</h2>
+            <p>
+                <strong><%= pool.name %></strong> is a Bitcoin <strong>solo
+                mining pool</strong>: every block your rig finds pays
+                <strong>directly to your address in the coinbase</strong>,
+                minus a small operator fee. There is no off-chain balance to
+                trust and no withdrawal step — payouts happen on chain in
+                the same transaction.
+            </p>
+
+            <h3 style="margin-top:1em">How to connect</h3>
+            <table class="lb" style="margin-bottom:1em">
+                <tbody>
+                    <tr>
+                        <td style="white-space:nowrap"><strong>URL</strong></td>
+                        <td class="mono"><%= 'stratum+tcp://' + pool.stratum_url %></td>
+                    </tr>
+                    <tr>
+                        <td style="white-space:nowrap"><strong>Username</strong></td>
+                        <td class="mono">&lt;your-bitcoin-address&gt;[.&lt;rig-label&gt;]</td>
+                    </tr>
+                    <tr>
+                        <td style="white-space:nowrap"><strong>Password</strong></td>
+                        <td class="muted">anything (e.g. <span class="mono">x</span>) — discarded; the pool has no accounts</td>
+                    </tr>
+                    <tr>
+                        <td style="white-space:nowrap"><strong>Operator fee</strong></td>
+                        <td><%= pool.fee_pct %>% of the block reward, paid in the same coinbase transaction</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <p class="muted small">
+                The <strong>username is your Bitcoin address</strong>. If
+                you run several rigs on the same address, append
+                <span class="mono">.rig-label</span> (e.g.
+                <span class="mono">bc1q…abc.s19-1</span>,
+                <span class="mono">bc1q…abc.s19-2</span>) so the dashboard can
+                tell them apart. The address must be a valid mainnet bech32
+                (<span class="mono">bc1…</span>) or base58check
+                (<span class="mono">1…</span> / <span class="mono">3…</span>) —
+                invalid addresses are rejected at <span class="mono">mining.authorize</span>.
+            </p>
+            <p class="muted small">
+                <strong>Shares</strong> below are accepted Proof-of-Work
+                submissions; in this solo build they exist for hashrate
+                estimation and per-rig accountability, not as payout
+                claims. You only get paid when one of your shares also
+                crosses the network target and becomes a block.
+            </p>
+        </section>
+        <% } else { %>
         <section class="card info">
             <h2>About the numbers on this page</h2>
             <p class="muted small">
@@ -47,6 +101,7 @@ const ago = (t) => {
                 bill against.
             </p>
         </section>
+        <% } %>
 
         <section class="card">
             <h2>Bitcoin node tip</h2>

@@ -22,6 +22,19 @@ app.use('/static', express.static(path.join(__dirname, 'public'), { maxAge: '1h'
 
 const db = openDb(path.resolve(__dirname, DB_PATH));
 
+// Public-pool homepage chrome. When POOL_PUBLIC=1 the index renders a
+// welcome banner explaining how to point a miner at the pool, instead of
+// the default 'About the numbers' explainer aimed at operators. The
+// strings are read from env so the same code can serve a private
+// operator dashboard and a public pool homepage from the same image.
+const pool = {
+    public:      process.env.POOL_PUBLIC === '1',
+    name:        process.env.POOL_NAME        || 'simplepool',
+    stratum_url: process.env.POOL_STRATUM_URL || 'stratum.example.com:3334',
+    fee_pct:     process.env.POOL_FEE_PCT     || '1',
+    description: process.env.POOL_DESCRIPTION || '',
+};
+
 app.get('/', (req, res) => {
     const ov = stats.overview(db);
     const lb = stats.leaderboard(db);
@@ -29,7 +42,7 @@ app.get('/', (req, res) => {
     const blocks = stats.recentBlocks(db, 5);
     const node = stats.nodeStatus(db);
     res.render('index', {
-        ov, lb, lbAddr, blocks, node,
+        ov, lb, lbAddr, blocks, node, pool,
         fmtHashrate: stats.fmtHashrate,
         fmtBtc: stats.fmtBtc,
     });
