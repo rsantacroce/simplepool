@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "bitcoind.h"
+#include "broadcast.h"
 #include "coinbase.h"
 #include "config.h"
 #include "log.h"
@@ -109,6 +110,7 @@ static size_t compute_merkle_branches_for_idx0(const uint8_t (*txids_le)[32],
 typedef struct {
     bitcoind_client_t *btc;
     store_t           *store;
+    broadcast_t       *bcast;
     stratum_server_t  *srv;
     proxy_config_t    *cfg;
 
@@ -238,6 +240,10 @@ static void on_share_cb(void *ctx, const char *worker_name,
                                 ts_ms, difficulty, is_block,
                                 block_hash_or_null);
     }
+    if (s && s->bcast) {
+        broadcast_share(s->bcast, worker_name, payout_address,
+                        ts_ms, difficulty, is_block, block_hash_or_null);
+    }
 }
 
 static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
@@ -245,6 +251,9 @@ static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
     server_ctx_t *s = (server_ctx_t *)ctx;
     if (s && s->store) {
         store_record_reject(s->store, worker_name, ts_ms, reason);
+    }
+    if (s && s->bcast) {
+        broadcast_reject(s->bcast, worker_name, ts_ms, reason);
     }
 }
 
@@ -270,6 +279,10 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
         store_record_block(s->store, ts_ms, (int)height, block_hash,
                            worker_name, finder_address,
                            reward_sats, fee_sats);
+    }
+    if (s && s->bcast) {
+        broadcast_block(s->bcast, worker_name, finder_address,
+                        ts_ms, height, block_hash, reward_sats, fee_sats);
     }
     LOG_INFO("BLOCK FOUND: height=%u finder=%s reward=%lld fee=%lld hash=%s",
              height, worker_name ? worker_name : "?",
@@ -303,6 +316,9 @@ static void *tip_watcher(void *arg) {
         uint64_t now_s = (uint64_t)time(NULL);
         store_record_node_tip(s->store, t->height - 1, t->prev_hash_hex,
                               now_s, now_s);
+        if (s->bcast) {
+            broadcast_node_tip(s->bcast, t->height - 1, t->prev_hash_hex, now_s);
+        }
 
         int need_rebuild = 0;
         pthread_mutex_lock(&s->lock);
@@ -424,6 +440,17 @@ int main(int argc, char **argv) {
         return 4;
     }
 
+    /* Broadcast (optional). */
+    broadcast_cfg_t bcfg2 = {0};
+    snprintf(bcfg2.url, sizeof bcfg2.url, "%s", cfg.redis_url);
+    bcfg2.publish_timeout_ms   = cfg.redis_publish_timeout_ms;
+    bcfg2.reconnect_backoff_ms = cfg.redis_reconnect_backoff_ms;
+    broadcast_t *bcast = NULL;
+    if (broadcast_open(&bcfg2, &bcast) < 0) {
+        LOG_WARN("broadcast_open failed; continuing without redis");
+        bcast = NULL;
+    }
+
     /* Initial template + job. */
     bitcoind_template_t *tmpl = NULL;
     if (bitcoind_get_block_template(&btc, &tmpl, err, sizeof err) < 0) {
@@ -448,6 +475,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&sctx.lock, NULL);
     sctx.btc   = &btc;
     sctx.store = store;
+    sctx.bcast = bcast;
     sctx.cfg   = &cfg;
     sctx.last_height = tmpl->height;
     snprintf(sctx.last_prev_hash, sizeof sctx.last_prev_hash, "%s", tmpl->prev_hash_hex);
@@ -459,6 +487,9 @@ int main(int argc, char **argv) {
         uint64_t now_s = (uint64_t)time(NULL);
         store_record_node_tip(store, tmpl->height - 1, tmpl->prev_hash_hex,
                               now_s, now_s);
+        if (bcast) {
+            broadcast_node_tip(bcast, tmpl->height - 1, tmpl->prev_hash_hex, now_s);
+        }
     }
 
     /* Start stratum server. */
@@ -533,6 +564,19 @@ int main(int argc, char **argv) {
              (unsigned long long)stats.blocks_committed,
              (unsigned long long)stats.pg_errors);
     store_close(store);
+
+    if (bcast) {
+        broadcast_stats_t bs;
+        broadcast_get_stats(bcast, &bs);
+        LOG_INFO("broadcast: published=%llu enqueued=%llu "
+                 "dropped(queue=%llu,redis=%llu) reconnects=%llu",
+                 (unsigned long long)bs.published,
+                 (unsigned long long)bs.enqueued,
+                 (unsigned long long)bs.dropped_queue_full,
+                 (unsigned long long)bs.dropped_redis_down,
+                 (unsigned long long)bs.reconnects);
+        broadcast_close(bcast);
+    }
 
     bitcoind_client_free(&btc);
     pthread_mutex_destroy(&sctx.lock);

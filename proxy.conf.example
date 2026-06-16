@@ -31,4 +31,27 @@ db_path = ./data/shares.db
 commit_window_ms = 100
 commit_max_shares = 100
 
+# Redis broadcast (optional). When set, accepted shares / rejects / blocks /
+# tip changes are PUBLISHed on channels pool:shares / pool:rejects /
+# pool:blocks / pool:tip as JSON. SQLite remains the source of truth — the
+# broadcast is fire-and-forget. Leave empty to disable.
+# redis_url = redis://127.0.0.1:6379
+redis_url =
+redis_publish_timeout_ms = 200
+redis_reconnect_backoff_ms = 2000
+
+# PPS / Thunder mode. "solo" preserves the original per-block direct-payout
+# flow. "pps" makes every block's coinbase deposit to the configured
+# pool_thunder_reserve_address via a BIP300 drivechain deposit (sidechain
+# 9 = Thunder), credits each accepted share to the worker's pps_credits
+# row, and expects stratum usernames to be Thunder addresses (base58).
+pool_mode = solo
+# pool_thunder_reserve_address = REPLACE_WITH_BASE58_THUNDER_ADDRESS
+# thunder_sidechain_number = 9
+# Optional override for the OP_RETURN payload after the OP_DRIVECHAIN output.
+# When empty, the ASCII bytes of pool_thunder_reserve_address are embedded
+# (matches Thunder's wallet behaviour).
+# thunder_op_return_hex =
+# pps_sats_per_diff = 1000      # sats credited per unit of share difficulty
+
 log_level = info

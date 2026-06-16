@@ -35,6 +35,27 @@ typedef struct {
     int  commit_window_ms;
     int  commit_max_shares;
 
+    /* redis broadcast — optional. Empty url disables the module. */
+    char redis_url[256];
+    int  redis_publish_timeout_ms;
+    int  redis_reconnect_backoff_ms;
+
+    /* PPS / Thunder mode. pool_mode = "solo" (default) preserves the
+     * existing per-block direct-payout flow. pool_mode = "pps" enables
+     * Thunder drivechain deposits in the coinbase and per-share PPS
+     * accrual in the database. */
+    char pool_mode[16];                       /* "solo" | "pps" */
+    char pool_thunder_reserve_address[128];   /* base58 Thunder address that
+                                               * receives every block's deposit */
+    int  thunder_sidechain_number;            /* 9 for Thunder */
+    /* OP_RETURN payload bytes following the OP_DRIVECHAIN output, hex-
+     * encoded. If empty, the configured pool_thunder_reserve_address is
+     * embedded as an ASCII string (matches Thunder's wallet behaviour). */
+    char thunder_op_return_hex[256];
+    /* PPS rate — sats credited per unit of share difficulty. Used by the
+     * payout worker downstream; the C proxy only computes accrued credits. */
+    double pps_sats_per_diff;
+
     /* logging */
     int  log_level;            /* 0..3 */
 } proxy_config_t;
