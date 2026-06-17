@@ -10,6 +10,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include "../src/broadcast.h"
+#include "../src/log.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -103,6 +104,12 @@ static void test_queue_overflow(void) {
 }
 
 int main(void) {
+    /* Two of these tests deliberately point the broadcaster at a dead
+     * port to verify the worker thread degrades gracefully when Redis is
+     * unreachable. That produces WARN lines that look like errors when
+     * `make test` is scanned — silence everything below ERROR. */
+    log_init(3);
+
     test_disabled();
     test_no_redis_running();
     test_queue_overflow();
