@@ -97,6 +97,32 @@ sqlite3 data/shares.db "
 sqlite3 data/shares.db "DELETE FROM payouts_in_flight WHERE id = <id>;"
 ```
 
+## Block-withholding audit (`audit.js`)
+
+PPS-specific fraud check. A worker can submit valid shares to collect
+PPS payouts and then quietly *not submit* the ones that would be
+blocks, keeping the on-chain reward off-pool. Detection is statistical:
+each worker's accrued share difficulty as a fraction of the pool's
+total predicts what fraction of blocks they should have found.
+
+```
+PAYOUT_DB_PATH=../data/shares.db node audit.js
+PAYOUT_DB_PATH=../data/shares.db node audit.js --window-hours 168
+PAYOUT_DB_PATH=../data/shares.db node audit.js --json    # for cron / slack
+```
+
+For each worker over the window:
+- **expected_blocks** = `pool_blocks * (worker_accrued / pool_accrued)`
+- **actual_blocks**   = blocks they actually found
+- **z**               = `(expected - actual) / sqrt(expected)`
+
+A worker is flagged `suspicious` when:
+- `expected_blocks >= 5` (below this, randomness dominates), AND
+- `z >= 3` (≈1-in-740 false-positive rate under honest mining)
+
+Run on a cron and pipe the `--json` output to your alert sink of choice.
+The audit reads the DB only — safe to run while the proxy is writing.
+
 ## Known gaps (deliberate)
 
 - **Flat 100-sat fee.** Will need a smarter fee model once Thunder
