@@ -1,23 +1,31 @@
 /* Payout loop.
  *
  * Each tick:
- *   1. SELECT workers from pps_credits where (accrued - paid) >= minSats.
- *   2. Check the Thunder reserve has enough available balance to cover
- *      the sum + a fee budget. If not, log and skip until next tick.
- *   3. For each due worker, call thunder.transfer(addr, owed, fee).
- *      On success, UPDATE pps_credits.paid_sats += owed.
- *      On failure, log and leave the row untouched — next tick retries.
+ *   1. SELECT workers from pps_credits where (accrued - paid) >= minSats
+ *      AND no in-flight payout row exists for them.
+ *   2. Check the Thunder reserve has enough balance to cover the sum
+ *      + a fee budget. If not, log and skip the tick.
+ *   3. For each due worker, run a three-step at-most-once protocol:
+ *        a. beginPayout()      — INSERT in payouts_in_flight (txid='')
+ *        b. thunder.transfer() — broadcast; on failure abortPayout() and
+ *                                move on (paid_sats untouched, safe to retry)
+ *        c. finalizePayout()   — atomic UPDATE(txid) + paid_sats +=
+ *                                + DELETE in one SQLite tx
  *
- * Failure isolation:
- *   - We do NOT batch payouts into a single tx. One miner's bad address
- *     or a transient RPC error must not block other miners' payouts.
- *   - If a Thunder tx is broadcast but our UPDATE fails, we'd
- *     double-pay on retry. That's acceptable rare-failure behaviour for
- *     the MVP; a stricter design would write a payouts_in_flight ledger
- *     keyed on (worker_id, txid) before broadcast and reconcile after.
- *     Left as a follow-up — flagged in payout/README.md. */
+ * Crash semantics:
+ *   - Crash between (a) and (b): row stays with txid=''. listDue skips
+ *     this worker forever until an operator inspects it and either
+ *     reconciles the broadcast (was it sent? if yes finalize manually,
+ *     if no delete the row).
+ *   - Crash between (b) and (c): same — row exists, broadcast went out,
+ *     but paid_sats not yet incremented. listStuck() surfaces it.
+ *   - Crash mid-(c): the SQLite tx atomically commits or rolls back.
+ *     No partial state.
+ *
+ * Failure isolation: per-worker payouts are NOT batched into one tx —
+ * a bad address or transient RPC error must not block other miners. */
 
-import { listDue, markPaid } from './db.js';
+import { listDue, listStuck, beginPayout, finalizePayout, abortPayout } from './db.js';
 
 /* Fee model: flat per-tx fee, configurable later. Thunder is a sidechain
  * with relatively low fees; 100 sats covers a one-input one-output tx
@@ -62,19 +70,49 @@ export async function runOnce(ctx, log) {
             log.info(`payout: DRY ${r.worker_name} -> ${r.thunder_address} ${r.owed_sats} sats`);
             continue;
         }
+        const rowId = beginPayout(db, r.worker_id, r.owed_sats, now_s);
+        let txid;
         try {
-            const txid = await thunder.transfer(
+            txid = await thunder.transfer(
                 r.thunder_address, r.owed_sats, TX_FEE_SATS);
-            markPaid(db, r.worker_id, r.owed_sats, now_s);
+        } catch (e) {
+            /* Broadcast failed cleanly — no txid was issued. Drop the
+             * in-flight row so the worker is eligible next tick. */
+            abortPayout(db, rowId);
+            log.warn(`payout: ${r.worker_name} broadcast failed: ${e.message}`);
+            failed++;
+            continue;
+        }
+        try {
+            finalizePayout(db, rowId, r.worker_id, r.owed_sats, txid, now_s);
             log.info(`payout: ${r.worker_name} -> ${r.thunder_address} ` +
                      `${r.owed_sats} sats txid=${txid}`);
             paid++;
         } catch (e) {
-            log.warn(`payout: ${r.worker_name} failed: ${e.message}`);
+            /* DB error after a successful broadcast. The row now has
+             * txid set; listStuck() will surface it on next startup. */
+            log.error(`payout: ${r.worker_name} FINALIZE FAILED after ` +
+                      `broadcast txid=${txid}: ${e.message}; ` +
+                      `paid_sats NOT updated — manual reconciliation required`);
             failed++;
         }
     }
     return { attempted: due.length, paid, failed };
+}
+
+/* Called once at startup. Doesn't auto-resolve; logs anything older
+ * than `staleAfterSec` so the operator can investigate. */
+export function reportStuck(ctx, log, staleAfterSec = 300) {
+    const now_s = Math.floor(Date.now() / 1000);
+    const rows = listStuck(ctx.db, staleAfterSec, now_s);
+    if (rows.length === 0) return;
+    log.warn(`payout: ${rows.length} stuck in-flight row(s) (>${staleAfterSec}s old):`);
+    for (const r of rows) {
+        const age = now_s - r.started_at;
+        const state = r.txid ? `broadcast txid=${r.txid}` : 'no txid';
+        log.warn(`  worker=${r.worker_name} sats=${r.sats} age=${age}s ${state} ` +
+                 `(reconcile: scripts/payout-reconcile.sh ${r.id})`);
+    }
 }
 
 export function startLoop(ctx, log) {

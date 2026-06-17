@@ -63,3 +63,26 @@ CREATE TABLE IF NOT EXISTS pps_credits (
   paid_sats     INTEGER NOT NULL DEFAULT 0,
   last_updated  INTEGER NOT NULL
 );
+
+/* In-flight payout ledger. The payout worker INSERTs a row before
+ * broadcasting a Thunder transaction; on successful broadcast it
+ * atomically (in one tx) sets txid, increments pps_credits.paid_sats,
+ * and DELETEs the row. The C proxy does not touch this table.
+ *
+ * Crash semantics:
+ *   - Row exists with txid='' → the broadcast may or may not have
+ *     happened; needs manual reconciliation. listDue skips workers
+ *     that have an in-flight row so we never double-pay.
+ *   - Row exists with txid set → the broadcast went out and we crashed
+ *     before the DELETE finished. The finalize tx is idempotent (its
+ *     paid_sats UPDATE is fenced by the row's existence), so a startup
+ *     sweep can finish it.
+ */
+CREATE TABLE IF NOT EXISTS payouts_in_flight (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  worker_id     INTEGER NOT NULL REFERENCES workers(id),
+  sats          INTEGER NOT NULL,
+  txid          TEXT NOT NULL DEFAULT '',
+  started_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS payouts_in_flight_worker_idx ON payouts_in_flight(worker_id);

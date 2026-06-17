@@ -80,7 +80,18 @@ static const char *SCHEMA_SQL =
     "  accrued_sats  INTEGER NOT NULL DEFAULT 0,"
     "  paid_sats     INTEGER NOT NULL DEFAULT 0,"
     "  last_updated  INTEGER NOT NULL"
-    ");";
+    ");"
+    /* In-flight payout ledger. Owned by the payout worker; the C proxy
+     * creates the table for fresh-DB convenience but never writes here.
+     * See schema.sql for the crash-semantics commentary. */
+    "CREATE TABLE IF NOT EXISTS payouts_in_flight ("
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  worker_id     INTEGER NOT NULL REFERENCES workers(id),"
+    "  sats          INTEGER NOT NULL,"
+    "  txid          TEXT NOT NULL DEFAULT '',"
+    "  started_at    INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX IF NOT EXISTS payouts_in_flight_worker_idx ON payouts_in_flight(worker_id);";
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
  * earlier schemas. Duplicate-column errors are silently ignored. */

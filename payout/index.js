@@ -19,7 +19,7 @@
 import { loadConfig }   from './lib/config.js';
 import { openDb }       from './lib/db.js';
 import { ThunderClient } from './lib/thunder.js';
-import { startLoop }    from './lib/payout.js';
+import { startLoop, reportStuck } from './lib/payout.js';
 
 const cfg = loadConfig();
 
@@ -41,6 +41,12 @@ const thunder = new ThunderClient({
     user: cfg.rpcUser,
     pass: cfg.rpcPass,
 });
+
+/* Surface any in-flight rows older than 5 minutes — they're a crashed
+ * payout that needs manual reconciliation. We never auto-resolve them
+ * because we can't safely tell apart "broadcast didn't happen" from
+ * "broadcast happened, finalize crashed". */
+reportStuck({ db }, log);
 
 const loop = startLoop({ db, thunder, cfg }, log);
 

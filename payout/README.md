@@ -52,15 +52,59 @@ PAYOUT_DRY_RUN=1 PAYOUT_DB_PATH=../data/shares.db \
 Payouts are **not batched** into a single tx — one bad address or RPC
 error must not block other miners.
 
+## At-most-once payout protocol
+
+Every payout flows through three steps so a crash anywhere in the
+middle can't double-pay:
+
+1. `INSERT INTO payouts_in_flight (worker_id, sats, txid='')` — reserve
+   the slot before Thunder is touched. `listDue()` skips any worker
+   with an in-flight row.
+2. `thunder.transfer(addr, sats, fee)` — broadcast. On clean failure
+   (RPC error before a txid is returned), the row is DELETEd and the
+   worker is eligible next tick.
+3. In ONE SQLite transaction: write the txid onto the in-flight row,
+   `paid_sats += sats`, DELETE the in-flight row.
+
+Crash semantics:
+
+| crash point | row state | action |
+| --- | --- | --- |
+| after (1), before (2) | txid='' | manual: did broadcast happen? unlikely. delete row. |
+| after (2), before (3) | txid='<id>' | manual: tx is on Thunder — finalize by hand. |
+| inside (3) | atomic — either fully applied or fully rolled back | nothing |
+
+On startup the worker calls `reportStuck()` which logs every in-flight
+row older than 5 minutes. Operator-driven reconciliation only; we
+never silently auto-finalize because we cannot safely distinguish
+"broadcast didn't happen" from "broadcast happened, finalize crashed"
+without Thunder-side mempool/chain lookup.
+
+To reconcile a stuck row by hand once you've confirmed via the Thunder
+node whether the tx is live:
+
+```
+# if the tx exists on Thunder: finalize manually
+sqlite3 data/shares.db "
+  BEGIN;
+  UPDATE pps_credits   SET paid_sats = paid_sats + (SELECT sats FROM payouts_in_flight WHERE id = <id>)
+                       WHERE worker_id = (SELECT worker_id FROM payouts_in_flight WHERE id = <id>);
+  DELETE FROM payouts_in_flight WHERE id = <id>;
+  COMMIT;
+"
+
+# if the tx never made it: just delete the row
+sqlite3 data/shares.db "DELETE FROM payouts_in_flight WHERE id = <id>;"
+```
+
 ## Known gaps (deliberate)
 
-- **No in-flight ledger.** If Thunder accepts the tx but our `UPDATE`
-  fails (process crash between broadcast and commit), we'd double-pay
-  the same `owed` next tick. For an MVP that's acceptable; a stricter
-  fix is a `payouts_in_flight` table keyed on `(worker_id, txid)`,
-  written before broadcast and reconciled on startup.
 - **Flat 100-sat fee.** Will need a smarter fee model once Thunder
   fee dynamics are observable. Currently hardcoded in `lib/payout.js`.
 - **No confirmation tracking.** Thunder's RPC doesn't expose per-tx
   confirmation counts; we treat a successful broadcast as final.
   That's how the rest of Thunder tooling works today.
+- **Manual reconciliation.** Crashes between broadcast and finalize
+  need an operator. The alternative (auto-reconcile via Thunder
+  mempool/chain lookup) is fragile without a getrawtransaction-style
+  endpoint and is left as a follow-up.
