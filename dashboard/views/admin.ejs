@@ -87,6 +87,7 @@ const fmtSats = (sats) => {
                         <th>Accrued</th>
                         <th>Paid</th>
                         <th>Updated</th>
+                        <th></th>
                     </tr>
                 </thead>
                 <tbody>
@@ -98,6 +99,7 @@ const fmtSats = (sats) => {
                         <td><%= fmtSats(w.accrued) %></td>
                         <td><%= fmtSats(w.paid) %></td>
                         <td class="muted small" title="<%= fmtTs(w.last_updated) %>"><%= ago(w.last_updated) %></td>
+                        <td><a href="/admin/worker/<%= w.worker_id %>" class="small">audit →</a></td>
                     </tr>
                     <% }) %>
                 </tbody>

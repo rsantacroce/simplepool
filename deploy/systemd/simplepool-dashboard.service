@@ -19,6 +19,9 @@ Environment=THUNDER_RPC_URL=http://127.0.0.1:6009
 # Environment=POOL_THUNDER_RESERVE_ADDRESS=<paste from proxy.conf>
 # Environment=ADMIN_USER=admin
 # Environment=ADMIN_PASSWORD=<generate with `openssl rand -base64 21`>
+# Must equal proxy.conf's pps_sats_per_diff — used by the per-worker
+# audit view to cross-check the C proxy's accrual math.
+Environment=POOL_PPS_SATS_PER_DIFF=1000
 ExecStart=/usr/bin/node @ROOT@/dashboard/server.js
 Restart=on-failure
 RestartSec=3

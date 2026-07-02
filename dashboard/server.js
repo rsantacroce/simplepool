@@ -76,6 +76,10 @@ const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASS = process.env.ADMIN_PASSWORD || '';
 const RESERVE_ADDRESS = process.env.POOL_THUNDER_RESERVE_ADDRESS || '(unset)';
 const THUNDER_RPC_URL = process.env.THUNDER_RPC_URL || 'http://127.0.0.1:6009';
+/* The rate the C proxy uses to convert difficulty → sats. Must match
+ * proxy.conf's pps_sats_per_diff or the worker-audit cross-check goes
+ * red. Passed via the same env-driven config path as the admin creds. */
+const PPS_SATS_PER_DIFF = parseFloat(process.env.POOL_PPS_SATS_PER_DIFF || '1000');
 
 function requireAdminAuth(req, res, next) {
     if (!ADMIN_USER || !ADMIN_PASS) {
@@ -112,6 +116,33 @@ app.get('/admin', requireAdminAuth, async (req, res) => {
 app.get('/api/admin/summary', requireAdminAuth, async (req, res) => {
     try {
         res.json(await adminSummary());
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/* Per-worker audit: "why is my balance N sats?" answered end-to-end. */
+function workerAuditFor(workerId) {
+    const audit = admin.workerAudit(db, workerId, { rate: PPS_SATS_PER_DIFF });
+    if (!audit) return null;
+    return audit;
+}
+
+app.get('/admin/worker/:id', requireAdminAuth, (req, res) => {
+    try {
+        const audit = workerAuditFor(parseInt(req.params.id, 10));
+        if (!audit) return res.status(404).render('404', { what: 'worker' });
+        res.render('admin-worker', { audit });
+    } catch (e) {
+        res.status(500).send('admin: ' + e.message);
+    }
+});
+
+app.get('/api/admin/worker/:id', requireAdminAuth, (req, res) => {
+    try {
+        const audit = workerAuditFor(parseInt(req.params.id, 10));
+        if (!audit) return res.status(404).json({ error: 'unknown worker id' });
+        res.json(audit);
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
