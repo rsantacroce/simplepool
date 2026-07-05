@@ -407,3 +407,24 @@ export function fmtHashrate(hps) {
     }
     return `${v.toFixed(2)} ${UNITS[i]}`;
 }
+
+/* Percentage of the pool. A small rig next to a large ASIC is
+ * legitimately a tiny fraction — `toFixed(2)` on 0.000044 renders
+ * "0.00%" and looks like a bug. Adaptive precision so every
+ * contributor sees a non-zero number:
+ *   >= 1%       — 2 decimals   (e.g., "54.32%")
+ *   >= 0.01%    — 3 decimals   (e.g., "0.523%")
+ *   >= 0.0001%  — 4 decimals   (e.g., "0.0523%")
+ *   >  0        — 2 sig figs  (e.g., "4.4e-5%")
+ *   == 0        — "0%"
+ * Kept as a stat-lib export so both the pool-wide and per-worker
+ * pages can share it. */
+export function fmtPct(p) {
+    if (p == null || !isFinite(p)) return '—';
+    if (p === 0) return '0%';
+    const abs = Math.abs(p);
+    if (abs >= 1)      return p.toFixed(2)  + '%';
+    if (abs >= 0.01)   return p.toFixed(3)  + '%';
+    if (abs >= 0.0001) return p.toFixed(4)  + '%';
+    return p.toPrecision(2) + '%';
+}

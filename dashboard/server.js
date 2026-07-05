@@ -42,13 +42,18 @@ app.get('/', (req, res) => {
         stratumUrl: PUBLIC_STRATUM_URL,
         fmtHashrate: stats.fmtHashrate,
         fmtBtc: stats.fmtBtc,
+        fmtPct: stats.fmtPct,
     });
 });
 
 app.get('/worker/:name', (req, res) => {
     const w = stats.worker(db, req.params.name, 86400, PPS_SATS_PER_DIFF);
     if (!w.worker) return res.status(404).render('404', { what: 'worker' });
-    res.render('worker', { ...w, name: req.params.name, fmtHashrate: stats.fmtHashrate });
+    res.render('worker', {
+        ...w, name: req.params.name,
+        fmtHashrate: stats.fmtHashrate,
+        fmtPct: stats.fmtPct,
+    });
 });
 
 app.get('/blocks', (req, res) => {

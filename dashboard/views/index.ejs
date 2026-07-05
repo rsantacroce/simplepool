@@ -143,7 +143,7 @@ password:  (ignored — any value)</pre>
                         <td><%= fmtN(m.rigs) %></td>
                         <td><%= fmtN(m.shares) %></td>
                         <td><%= fmtHashrate(m.hashrate_est) %></td>
-                        <td><%= m.share_of_pool_pct.toFixed(2) %>%</td>
+                        <td><%= fmtPct(m.share_of_pool_pct) %></td>
                         <td title="<%= fmtTs(m.last_seen) %>"><%= ago(m.last_seen) %></td>
                     </tr>
                 <% }) %>
@@ -170,7 +170,7 @@ password:  (ignored — any value)</pre>
                         <td><%= fmtHashrate(w.hashrate_5m) %></td>
                         <td><%= fmtHashrate(w.hashrate_1h) %></td>
                         <td><%= fmtHashrate(w.hashrate_est) %></td>
-                        <td><%= w.share_of_pool_pct.toFixed(2) %>%</td>
+                        <td><%= fmtPct(w.share_of_pool_pct) %></td>
                         <td title="<%= fmtTs(w.last_seen) %>"><%= ago(w.last_seen) %></td>
                     </tr>
                 <% }) %>
