@@ -91,7 +91,33 @@ static const char *SCHEMA_SQL =
     "  txid          TEXT NOT NULL DEFAULT '',"
     "  started_at    INTEGER NOT NULL"
     ");"
-    "CREATE INDEX IF NOT EXISTS payouts_in_flight_worker_idx ON payouts_in_flight(worker_id);";
+    "CREATE INDEX IF NOT EXISTS payouts_in_flight_worker_idx ON payouts_in_flight(worker_id);"
+    /* pps-classic deposit ledger. Owned by the admin dashboard; the C
+     * proxy never writes here. Created here so a fresh DB is complete. */
+    "CREATE TABLE IF NOT EXISTS deposits ("
+    "  id                INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  ts                INTEGER NOT NULL,"
+    "  btc_txid          TEXT    NOT NULL,"
+    "  sats_deposited    INTEGER NOT NULL,"
+    "  fee_sats          INTEGER NOT NULL,"
+    "  thunder_recipient TEXT    NOT NULL,"
+    "  ctip_seq_before   INTEGER,"
+    "  ctip_seq_after    INTEGER,"
+    "  notes             TEXT"
+    ");"
+    "CREATE INDEX IF NOT EXISTS deposits_ts_idx ON deposits(ts);"
+    /* Payout history — permanent record populated by payout worker. */
+    "CREATE TABLE IF NOT EXISTS payouts ("
+    "  id           INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  worker_id    INTEGER NOT NULL REFERENCES workers(id),"
+    "  sats         INTEGER NOT NULL,"
+    "  fee_sats     INTEGER NOT NULL,"
+    "  txid         TEXT    NOT NULL,"
+    "  paid_at      INTEGER NOT NULL,"
+    "  note         TEXT"
+    ");"
+    "CREATE INDEX IF NOT EXISTS payouts_worker_ts_idx ON payouts(worker_id, paid_at);"
+    "CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);";
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
  * earlier schemas. Duplicate-column errors are silently ignored. */

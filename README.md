@@ -317,6 +317,22 @@ To pull edits made directly on a server back into a local checkout (so
 you can commit + push from here), use
 [`scripts/sync-from-server.sh`](scripts/sync-from-server.sh).
 
+### Docker
+
+An alternative to the bare-metal script: containerized builds of the
+three services (stratum proxy, dashboard, payout worker) under
+[`deploy/docker/`](deploy/docker/). One `docker compose up -d --build`
+gets the whole app stack running against a Thunder daemon and Bitcoin
+Core that live on the host (or wherever you point them). Shared bind
+mount on `data/` so the SQLite ledger is portable across restarts /
+image rebuilds. See [`deploy/docker/README.md`](deploy/docker/README.md)
+for the full walkthrough.
+
+Note: the drivechain infrastructure (`bitcoind`, Thunder, the
+`bip300301_enforcer`, `electrs`) is intentionally NOT containerized —
+those daemons have their own lifecycles and typically run bare-metal on
+the same host.
+
 ## Config keys
 
 ```

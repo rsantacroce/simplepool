@@ -23,6 +23,14 @@ app.use('/static', express.static(path.join(__dirname, 'public'), { maxAge: '1h'
 
 const db = openDb(path.resolve(__dirname, DB_PATH));
 
+/* Shown on the public "Connect a miner" card. Env-driven so the shipped
+ * template doesn't hardcode any particular deployment's host. */
+const PUBLIC_STRATUM_URL = process.env.PUBLIC_STRATUM_URL || 'stratum+tcp://<pool-host>:3334';
+/* Read once here so the public per-worker page can render the audit
+ * cross-check for the miner without needing admin auth. The admin
+ * patch block below also reads this — the constant is shared. */
+const PPS_SATS_PER_DIFF = parseFloat(process.env.POOL_PPS_SATS_PER_DIFF || '1000');
+
 app.get('/', (req, res) => {
     const ov = stats.overview(db);
     const lb = stats.leaderboard(db);
@@ -31,15 +39,21 @@ app.get('/', (req, res) => {
     const node = stats.nodeStatus(db);
     res.render('index', {
         ov, lb, lbAddr, blocks, node,
+        stratumUrl: PUBLIC_STRATUM_URL,
         fmtHashrate: stats.fmtHashrate,
         fmtBtc: stats.fmtBtc,
+        fmtPct: stats.fmtPct,
     });
 });
 
 app.get('/worker/:name', (req, res) => {
-    const w = stats.worker(db, req.params.name);
+    const w = stats.worker(db, req.params.name, 86400, PPS_SATS_PER_DIFF);
     if (!w.worker) return res.status(404).render('404', { what: 'worker' });
-    res.render('worker', { ...w, name: req.params.name, fmtHashrate: stats.fmtHashrate });
+    res.render('worker', {
+        ...w, name: req.params.name,
+        fmtHashrate: stats.fmtHashrate,
+        fmtPct: stats.fmtPct,
+    });
 });
 
 app.get('/blocks', (req, res) => {
@@ -76,6 +90,8 @@ const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASS = process.env.ADMIN_PASSWORD || '';
 const RESERVE_ADDRESS = process.env.POOL_THUNDER_RESERVE_ADDRESS || '(unset)';
 const THUNDER_RPC_URL = process.env.THUNDER_RPC_URL || 'http://127.0.0.1:6009';
+/* PPS_SATS_PER_DIFF is declared at the top of the file so both the
+ * public /worker/:name view and the admin routes can share it. */
 
 function requireAdminAuth(req, res, next) {
     if (!ADMIN_USER || !ADMIN_PASS) {
@@ -91,13 +107,20 @@ function requireAdminAuth(req, res, next) {
 }
 
 async function adminSummary() {
-    const [reserve, totals, workers, inFlight] = await Promise.all([
+    const [reserve, totals, workers, inFlight, payouts, deposits, blocks] = await Promise.all([
         admin.thunderBalance(THUNDER_RPC_URL),
         Promise.resolve(admin.poolTotals(db)),
         Promise.resolve(admin.perWorkerBalances(db)),
         Promise.resolve(admin.inFlight(db)),
+        Promise.resolve(admin.recentPayouts(db, 25)),
+        Promise.resolve(admin.recentDeposits(db, 25)),
+        Promise.resolve(admin.recentBlocksFound(db, 15)),
     ]);
-    return { reserve, reserveAddress: RESERVE_ADDRESS, totals, workers, inFlight };
+    return {
+        reserve, reserveAddress: RESERVE_ADDRESS,
+        totals, workers, inFlight,
+        payouts, deposits, blocks,
+    };
 }
 
 app.get('/admin', requireAdminAuth, async (req, res) => {
@@ -112,6 +135,34 @@ app.get('/admin', requireAdminAuth, async (req, res) => {
 app.get('/api/admin/summary', requireAdminAuth, async (req, res) => {
     try {
         res.json(await adminSummary());
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/* Per-worker audit: "why is my balance N sats?" answered end-to-end. */
+function workerAuditFor(workerId) {
+    const audit = admin.workerAudit(db, workerId, { rate: PPS_SATS_PER_DIFF });
+    if (!audit) return null;
+    audit.payouts = admin.payoutsForWorker(db, workerId, 100);
+    return audit;
+}
+
+app.get('/admin/worker/:id', requireAdminAuth, (req, res) => {
+    try {
+        const audit = workerAuditFor(parseInt(req.params.id, 10));
+        if (!audit) return res.status(404).render('404', { what: 'worker' });
+        res.render('admin-worker', { audit });
+    } catch (e) {
+        res.status(500).send('admin: ' + e.message);
+    }
+});
+
+app.get('/api/admin/worker/:id', requireAdminAuth, (req, res) => {
+    try {
+        const audit = workerAuditFor(parseInt(req.params.id, 10));
+        if (!audit) return res.status(404).json({ error: 'unknown worker id' });
+        res.json(audit);
     } catch (e) {
         res.status(500).json({ error: e.message });
     }

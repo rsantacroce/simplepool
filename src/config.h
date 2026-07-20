@@ -19,6 +19,12 @@ typedef struct {
     double vardiff_max;           /* default 1e12; clamped by network diff */
     int    vardiff_window_sec;    /* retarget interval, default 30 */
 
+    /* Idle-connection reaper. A connection that hasn't sent any bytes in
+     * idle_timeout_sec is closed. Guards against half-open TCPs from
+     * crashed miners and clients that connect but never authenticate.
+     * Set to a negative value to disable entirely; 0 uses the default. */
+    int    idle_timeout_sec;      /* default 600 (10 min) */
+
     /* bitcoind */
     char bitcoind_url[512];
     char bitcoind_user[128];
@@ -44,9 +50,16 @@ typedef struct {
      * existing per-block direct-payout flow. pool_mode = "pps" enables
      * Thunder drivechain deposits in the coinbase and per-share PPS
      * accrual in the database. */
-    char pool_mode[16];                       /* "solo" | "pps" */
+    char pool_mode[16];                       /* "solo" | "pps" | "pps-classic" */
+    /* pps-classic: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH), NOT
+     * the Thunder reserve. The operator later batches this BTC into Thunder
+     * via the admin dashboard's deposit action. Required when
+     * pool_mode = pps-classic; ignored otherwise. */
+    char pool_btc_address[128];
     char pool_thunder_reserve_address[128];   /* base58 Thunder address that
-                                               * receives every block's deposit */
+                                               * receives every block's deposit
+                                               * — pps mode only, ignored in
+                                               * pps-classic */
     int  thunder_sidechain_number;            /* 9 for Thunder */
     /* OP_RETURN payload bytes following the OP_DRIVECHAIN output, hex-
      * encoded. If empty, the configured pool_thunder_reserve_address is
