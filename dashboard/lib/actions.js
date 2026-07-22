@@ -183,21 +183,25 @@ export async function createDeposit({
         (typeof j.txid === 'string' ? j.txid : null);
 
     /* Log to deposits so /admin history shows it. Best-effort — never fail
-     * the whole action just because the DB write hiccuped. */
-    try {
-        const nowSec = Math.floor(Date.now() / 1000);
-        db.prepare(`
-            INSERT INTO deposits
-                (ts, btc_txid, sats_deposited, fee_sats, thunder_recipient, ctip_before, ctip_after, note)
-            VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
-        `).run(nowSec, txid || '(pending)', Number(val), Number(fee),
-               address, `via admin dashboard, sidechain_id=${sid}`);
-    } catch (e) {
-        return {
-            ok: true,
-            msg: `deposit tx created (DB log failed: ${e.message})`,
-            detail: txid ? `txid=${txid}` : stdout.slice(0, 300),
-        };
+     * the whole action just because the DB write hiccuped. `db` may be
+     * null if the writable handle couldn't open (e.g. file missing) —
+     * still consider the deposit successful. */
+    if (db && typeof db.prepare === 'function') {
+        try {
+            const nowSec = Math.floor(Date.now() / 1000);
+            db.prepare(`
+                INSERT INTO deposits
+                    (ts, btc_txid, sats_deposited, fee_sats, thunder_recipient, ctip_before, ctip_after, note)
+                VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
+            `).run(nowSec, txid || '(pending)', Number(val), Number(fee),
+                   address, `via admin dashboard, sidechain_id=${sid}`);
+        } catch (e) {
+            return {
+                ok: true,
+                msg: `deposit tx created (DB log failed: ${e.message})`,
+                detail: txid ? `txid=${txid}` : stdout.slice(0, 300),
+            };
+        }
     }
     return {
         ok: true,

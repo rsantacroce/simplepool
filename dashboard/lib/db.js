@@ -7,7 +7,7 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 
-export function openDb(dbPath) {
+export function openDb(dbPath, { readonly = true } = {}) {
     let db = null;
     let lastTryMs = 0;
 
@@ -18,7 +18,7 @@ export function openDb(dbPath) {
         lastTryMs = now;
         if (!fs.existsSync(dbPath)) return null;
         try {
-            db = new Database(dbPath, { readonly: true, fileMustExist: true });
+            db = new Database(dbPath, { readonly, fileMustExist: true });
             // WAL is required for read-consistency while the C proxy writes.
             db.pragma('journal_mode = WAL');
             db.pragma('busy_timeout = 2000');

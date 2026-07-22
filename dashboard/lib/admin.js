@@ -254,6 +254,33 @@ export function recentBlocksFound(handle, limit = 15) {
     }));
 }
 
+/* Probe the enforcer wallet's BTC balance via gRPC (WalletService.GetBalance).
+ * Shells out to grpcurl — same binary the deposit action uses. Short
+ * timeout so the admin page renders even when the enforcer is slow.
+ * Returns { ok, confirmed_sats, pending_sats, has_synced, error? }.  */
+export async function enforcerBalance(grpcurlBin, enforcerGrpcAddr, timeoutMs = 3000) {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    try {
+        const { stdout } = await execFileAsync(grpcurlBin, [
+            '-plaintext', '-d', '{}',
+            enforcerGrpcAddr,
+            'cusf.mainchain.v1.WalletService/GetBalance',
+        ], { timeout: timeoutMs, maxBuffer: 256 * 1024 });
+        const j = JSON.parse(stdout);
+        return {
+            ok: true,
+            confirmed_sats: Number(j.confirmedSats ?? 0),
+            pending_sats:   Number(j.pendingSats   ?? 0),
+            has_synced:     Boolean(j.hasSynced),
+        };
+    } catch (e) {
+        const msg = (e.stderr || '').toString().slice(0, 200) || e.message;
+        return { ok: false, error: msg, confirmed_sats: 0, pending_sats: 0, has_synced: false };
+    }
+}
+
 /* Minimal Thunder JSON-RPC client — we only need `balance()`. Short
  * timeout so the admin page renders promptly even when Thunder is
  * unreachable. */

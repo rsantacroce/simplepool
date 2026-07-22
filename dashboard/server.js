@@ -24,6 +24,11 @@ app.disable('x-powered-by');
 app.use('/static', express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));
 
 const db = openDb(path.resolve(__dirname, DB_PATH));
+/* Separate writable handle for admin write actions (only the deposit
+ * action needs it today — inserts into `deposits`). Kept distinct from
+ * the read-only `db` so accidental writes from stats.js / admin.js
+ * still hit the read-only handle and fail fast. */
+const dbRw = openDb(path.resolve(__dirname, DB_PATH), { readonly: false });
 
 /* Shown on the public "Connect a miner" card. Env-driven so the shipped
  * template doesn't hardcode any particular deployment's host. */
@@ -115,8 +120,9 @@ function requireAdminAuth(req, res, next) {
 }
 
 async function adminSummary() {
-    const [reserve, totals, workers, inFlight, payouts, deposits, blocks] = await Promise.all([
+    const [reserve, enforcer, totals, workers, inFlight, payouts, deposits, blocks] = await Promise.all([
         admin.thunderBalance(THUNDER_RPC_URL),
+        admin.enforcerBalance(GRPCURL_BIN, ENFORCER_GRPC_ADDR),
         Promise.resolve(admin.poolTotals(db)),
         Promise.resolve(admin.perWorkerBalances(db)),
         Promise.resolve(admin.inFlight(db)),
@@ -126,6 +132,7 @@ async function adminSummary() {
     ]);
     return {
         reserve, reserveAddress: RESERVE_ADDRESS,
+        enforcer,
         totals, workers, inFlight,
         payouts, deposits, blocks,
     };
@@ -206,6 +213,11 @@ app.post('/admin/action/trigger-payout',
 app.post('/admin/action/deposit',
     requireAdminAuth, parseAdminForm, requireCsrf,
     async (req, res) => {
+        /* Unwrap the lazy dbRw handle — createDeposit expects a raw
+         * better-sqlite3 Database with .prepare(). If the file isn't
+         * openable, dbGet returns null and createDeposit surfaces the
+         * gRPC result without the DB row. */
+        const dbGet = dbRw.get();
         const r = await actions.createDeposit({
             grpcurlBin:       GRPCURL_BIN,
             enforcerGrpcAddr: ENFORCER_GRPC_ADDR,
@@ -213,7 +225,7 @@ app.post('/admin/action/deposit',
             address:          (req.body?.address || '').trim(),
             valueSats:        req.body?.value_sats,
             feeSats:          req.body?.fee_sats,
-            db,
+            db:               dbGet,
         });
         flashRedirect(res, r);
     });

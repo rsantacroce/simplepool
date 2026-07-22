@@ -116,10 +116,13 @@ const fmtSats = (sats) => {
                     <label style="display:block;margin-bottom:0.25em"><strong>Deposit BTC → Thunder reserve</strong></label>
                     <p class="muted small" style="margin:0 0 0.5em 0">
                         Spend enforcer-wallet BTC into a Thunder deposit
-                        (sidechain #<%= reserveSidechainId %>). Enforcer wallet
-                        must already hold spendable UTXOs — fund it first
-                        with a plain <code>bitcoin-cli sendtoaddress</code>
-                        to an enforcer address.
+                        (sidechain #<%= reserveSidechainId %>).
+                        <% if (enforcer.ok) { %>
+                            <br><strong>Spendable now:</strong> <%= fmtSats(enforcer.confirmed_sats) %>
+                            <% if (enforcer.pending_sats > 0) { %>
+                                (+<%= fmtSats(enforcer.pending_sats) %> pending)
+                            <% } %>
+                        <% } %>
                     </p>
                     <label class="small muted">Recipient (Thunder address)</label>
                     <input type="text" name="address" value="<%= reserveAddress === '(unset)' ? '' : reserveAddress %>"
@@ -149,6 +152,25 @@ const fmtSats = (sats) => {
             <% } else { %>
                 <p class="muted">Thunder RPC unreachable: <em><%= reserve.error %></em></p>
                 <p class="mono small muted" style="margin-top:0.5em;word-break:break-all"><%= reserveAddress %></p>
+            <% } %>
+        </section>
+
+        <section class="card">
+            <h2>Pool BTC (enforcer wallet)</h2>
+            <p class="muted small" style="margin-top:0">
+                Spendable balance the <strong>Deposit BTC → Thunder</strong>
+                action can draw from. Fund it by sending BTC to a fresh
+                enforcer address (<code>CreateNewAddress</code>) from your
+                operator wallet.
+            </p>
+            <% if (enforcer.ok) { %>
+                <div class="grid">
+                    <div><label>Confirmed (spendable)</label><strong><%= fmtSats(enforcer.confirmed_sats) %></strong></div>
+                    <div><label>Pending (in mempool)</label><strong><%= fmtSats(enforcer.pending_sats) %></strong></div>
+                    <div><label>Synced?</label><strong><%= enforcer.has_synced ? '✓' : '✗' %></strong></div>
+                </div>
+            <% } else { %>
+                <p class="muted">Enforcer gRPC unreachable: <em><%= enforcer.error %></em></p>
             <% } %>
         </section>
 
