@@ -33,7 +33,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_${GRPCURL_ARCH}.tar.gz" \
     && tar -xzf /tmp/grpcurl.tgz -C /usr/local/bin grpcurl \
     && chmod +x /usr/local/bin/grpcurl \
-    && rm /tmp/grpcurl.tgz
+    && rm /tmp/grpcurl.tgz \
+    # Smoke-test the binary: catches a wrong-arch download or bad extraction
+    # at build time instead of at first admin deposit.
+    && grpcurl -version
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY dashboard/ ./
