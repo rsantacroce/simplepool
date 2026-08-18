@@ -10,8 +10,10 @@
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="$ROOT/.regtest/bin"
+BIN="${REGTEST_BIN_DIR:-${REGTEST_DIR:-$ROOT/.regtest}/bin}"
+THUNDER_RPC_PORT="${REGTEST_THUNDER_RPC_PORT:-6009}"
 TCLI="$BIN/thunder-cli"
+tcli() { "$TCLI" --rpc-url="http://127.0.0.1:$THUNDER_RPC_PORT" "$@"; }
 
 if [[ ! -x "$TCLI" ]]; then
     echo "missing $TCLI — run scripts/regtest/setup.sh" >&2
@@ -20,20 +22,20 @@ fi
 
 # Probe: does Thunder's wallet already have a seed? get-new-address
 # succeeds silently when yes; errors "no seed" to stderr when no.
-if ADDR="$($TCLI get-new-address 2>/dev/null)" && [[ -n "$ADDR" ]]; then
+if ADDR="$(tcli get-new-address 2>/dev/null)" && [[ -n "$ADDR" ]]; then
     echo "==> Thunder wallet already initialised"
     echo "  new address: $ADDR"
     exit 0
 fi
 
 echo "==> generating fresh Thunder wallet mnemonic"
-MNEMONIC="$($TCLI generate-mnemonic)"
+MNEMONIC="$(tcli generate-mnemonic)"
 echo "  mnemonic: $MNEMONIC"
 
 echo "==> setting seed"
-$TCLI set-seed-from-mnemonic "$MNEMONIC" >/dev/null
+tcli set-seed-from-mnemonic "$MNEMONIC" >/dev/null
 
-ADDR="$($TCLI get-new-address)"
+ADDR="$(tcli get-new-address)"
 
 echo ""
 echo "Thunder wallet ready."
@@ -46,5 +48,6 @@ echo ""
 echo "To send a deposit into this wallet from the mainchain:"
 echo "  scripts/enforcer-rpc.sh cusf.mainchain.v1.WalletService/CreateDepositTransaction \\"
 echo "    '{\"sidechain_id\":9, \"address\":\"$ADDR\", \"value_sats\":100000000, \"fee_sats\":1000}'"
-echo "  scripts/enforcer-rpc.sh --stream cusf.mainchain.v1.WalletService/GenerateBlocks \\"
-echo "    '{\"blocks\":1}'"
+echo "  # mine it:"
+echo "  scripts/enforcer-rpc.sh cusf.mainchain.v1.MiningService/GenerateToAddress \\"
+echo "    '{\"blocks\":1, \"address\":\"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080\"}'"

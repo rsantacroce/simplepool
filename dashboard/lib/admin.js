@@ -6,6 +6,7 @@
 // request on a slow / down Thunder node.
 
 import { enforcerRpc } from './enforcer.js';
+import { poolMeta, rateVerification } from './stats.js';
 
 function unwrap(handle) {
     if (typeof handle?.get === 'function') return handle.get();
@@ -56,12 +57,16 @@ export function perWorkerBalances(handle) {
     }));
 }
 
-/* Current in-flight payouts. A row with an empty txid means the
- * broadcast may or may not have gone out (worker crashed between
- * INSERT and RPC); a row with a txid means the broadcast succeeded
- * but the finalize transaction crashed. Either state requires
- * operator attention — see payout/README.md for the reconciliation
- * runbook. */
+/* Current in-flight payouts.
+ *
+ * A row WITH a txid is a broadcast payout waiting to be mined — routine, and
+ * it clears itself when the worker sees the transaction confirm. Since
+ * Thunder advances only a few times a day these are often hours old, which is
+ * not by itself a problem.
+ *
+ * A row with an EMPTY txid is the one that needs a human: the worker crashed
+ * between INSERT and the Thunder RPC, so we cannot tell whether the broadcast
+ * went out. Never auto-resolved — see payout/README.md for the runbook. */
 export function inFlight(handle) {
     const db = unwrap(handle);
     if (!db) return [];
@@ -80,14 +85,19 @@ export function inFlight(handle) {
 }
 
 /* Per-worker audit — "why is my accrued balance N sats?" answered with
- * the formula, a cross-check, per-day rollup, and the last N shares.
+ * the stored credits, a cross-check, per-day rollup, and the last N shares.
  *
- * The C proxy credits each accepted share `FLOOR(difficulty * rate)`
- * sats where `rate` is proxy.conf's pps_sats_per_diff. Truncation is
- * per-share, not once at the end, so `Σ FLOOR(diff × rate)` is the
- * authoritative cross-check — NOT `FLOOR(Σ diff × rate)`. Both are
- * shown so operators can spot a config drift immediately. */
-export function workerAudit(handle, workerId, { rate, recentLimit = 100, dayLimit = 30 } = {}) {
+ * The C proxy credits each accepted share FLOOR(difficulty * rate) and
+ * writes that amount to shares.credited_sats. The audit sums that column
+ * rather than recomputing it: the rate is derived per template and moves
+ * with network difficulty, so re-deriving history against a current rate
+ * would show a false mismatch after every difficulty change. Truncation is
+ * also per-share, so only the stored per-row values reconstruct the ledger
+ * exactly.
+ *
+ * Rate metadata is read from pool_meta — written by the proxy itself — so
+ * this view can never disagree with the process that did the crediting. */
+export function workerAudit(handle, workerId, { recentLimit = 100, dayLimit = 30 } = {}) {
     const db = unwrap(handle);
     if (!db) return null;
     const worker = db.prepare(`
@@ -99,16 +109,21 @@ export function workerAudit(handle, workerId, { rate, recentLimit = 100, dayLimi
     `).get(workerId);
     if (!worker) return null;
 
+    /* Rate provenance from the proxy itself — never from dashboard config. */
+    const meta = poolMeta(db);
+    /* The one part of this page that checks rather than reports. */
+    const verification = rateVerification(db, workerId);
+
     const totals = db.prepare(`
-        SELECT COUNT(*)                                       AS share_count,
-               COALESCE(SUM(difficulty), 0)                   AS sum_difficulty,
-               COALESCE(SUM(CAST(difficulty * ? AS INTEGER)), 0) AS accrued_computed,
-               MIN(ts)                                        AS first_ts,
-               MAX(ts)                                        AS last_ts,
-               COUNT(*) FILTER (WHERE is_block = 1)           AS blocks_found
+        SELECT COUNT(*)                              AS share_count,
+               COALESCE(SUM(difficulty), 0)          AS sum_difficulty,
+               COALESCE(SUM(credited_sats), 0)       AS accrued_computed,
+               MIN(ts)                               AS first_ts,
+               MAX(ts)                               AS last_ts,
+               COUNT(*) FILTER (WHERE is_block = 1)  AS blocks_found
         FROM   shares
         WHERE  worker_id = ? AND is_block IS NOT NULL
-    `).get(rate, workerId);
+    `).get(workerId);
 
     /* Day-level rollup: (day, shares, sum_diff, sats_credited). Only
      * days with activity, most-recent first. */
@@ -116,24 +131,24 @@ export function workerAudit(handle, workerId, { rate, recentLimit = 100, dayLimi
         SELECT DATE(ts, 'unixepoch') AS day,
                COUNT(*)              AS shares,
                SUM(difficulty)       AS sum_diff,
-               SUM(CAST(difficulty * ? AS INTEGER)) AS accrued_delta,
+               SUM(credited_sats)    AS accrued_delta,
                COUNT(*) FILTER (WHERE is_block = 1) AS blocks
         FROM   shares
         WHERE  worker_id = ?
         GROUP  BY day
         ORDER  BY day DESC
         LIMIT  ?
-    `).all(rate, workerId, dayLimit);
+    `).all(workerId, dayLimit);
 
     /* Most-recent shares, cheapest to derive running_accrued client-side. */
     const recent = db.prepare(`
         SELECT id, ts, difficulty, is_block, block_hash,
-               CAST(difficulty * ? AS INTEGER) AS credit_sats
+               credited_sats AS credit_sats
         FROM   shares
         WHERE  worker_id = ?
         ORDER  BY ts DESC
         LIMIT  ?
-    `).all(rate, workerId, recentLimit);
+    `).all(workerId, recentLimit);
 
     return {
         worker: {
@@ -143,7 +158,9 @@ export function workerAudit(handle, workerId, { rate, recentLimit = 100, dayLimi
             first_seen: Number(worker.first_seen),
             last_seen:  Number(worker.last_seen),
         },
-        rate,
+        rate: meta ? meta.rate_sats_per_diff : null,
+        meta,
+        verification,
         ledger: {
             accrued: Number(worker.accrued_sats || 0),
             paid:    Number(worker.paid_sats    || 0),
@@ -298,5 +315,54 @@ export async function thunderBalance(rpcUrl, timeoutMs = 1500) {
         return { ok: false, error: e.message, available_sats: 0, total_sats: 0 };
     } finally {
         clearTimeout(t);
+    }
+}
+
+/* Broadcast attempts — successes and failures — newest first.
+ *
+ * `deposits` and `payouts` hold what succeeded. This holds what was *tried*,
+ * with the transaction attached, which is what an operator needs when the
+ * node rejects something. Filter by kind ('deposit' | 'payout') or pass null
+ * for both.
+ *
+ * Tolerates a database predating the table: returns [] rather than throwing,
+ * so an older DB degrades to "no history" instead of a 500. */
+export function recentTxAttempts(handle, { kind = null, limit = 25, failedOnly = false } = {}) {
+    const db = unwrap(handle);
+    if (!db) return [];
+    try {
+        const where = [];
+        const args  = [];
+        if (kind)       { where.push('a.kind = ?');       args.push(kind); }
+        if (failedOnly) { where.push("a.status = 'failed'"); }
+        const sql = `
+            SELECT a.id, a.ts, a.kind, a.status, a.stage, a.txid, a.raw_tx,
+                   a.amount_sats, a.fee_sats, a.destination, a.worker_id,
+                   a.error, a.detail, w.name AS worker_name
+              FROM tx_attempts a
+              LEFT JOIN workers w ON w.id = a.worker_id
+             ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+             ORDER BY a.ts DESC, a.id DESC
+             LIMIT ?`;
+        args.push(limit);
+        return db.prepare(sql).all(...args).map(r => ({
+            id:          Number(r.id),
+            ts:          Number(r.ts),
+            kind:        r.kind,
+            status:      r.status,
+            stage:       r.stage,
+            txid:        r.txid,
+            raw_tx:      r.raw_tx,
+            amount_sats: r.amount_sats === null ? null : Number(r.amount_sats),
+            fee_sats:    r.fee_sats    === null ? null : Number(r.fee_sats),
+            destination: r.destination,
+            worker_id:   r.worker_id === null ? null : Number(r.worker_id),
+            worker_name: r.worker_name,
+            error:       r.error,
+            detail:      r.detail,
+            ok:          r.status === 'broadcast',
+        }));
+    } catch {
+        return [];   /* pre-tx_attempts DB */
     }
 }

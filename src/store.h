@@ -11,6 +11,10 @@ typedef struct {
     char path[512];
     int  commit_window_ms;     /* default 100 */
     int  commit_max_shares;    /* default 100 */
+    /* Days of template history to keep; 0 disables pruning. Enforced when a
+     * new template row is opened, so a busy pool trims itself and an idle
+     * one leaves the table alone. */
+    int  templates_retention_days;
 } store_cfg_t;
 
 /* Open the DB (creates file + applies schema if missing). Starts a writer
@@ -45,11 +49,23 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
 
 /* Record an accepted share with the miner's payout_address so the worker
  * row can be tagged. payout_address may be NULL (legacy/tests). The
- * share_hash semantics match store_record_share() above. */
+ * share_hash semantics match store_record_share() above.
+ *
+ * credited_sats is what this share was credited at the rate in force when
+ * it was accepted, stored on the row so audits report history instead of
+ * recomputing it against whatever rate is current. Pass 0 in solo mode or
+ * when no accrual applies.
+ *
+ * rate_used is the multiplicand that produced credited_sats. Pass the exact
+ * double that was multiplied, not a rounded copy: the audit re-derives
+ * CAST(difficulty * rate_used AS INTEGER) and expects credited_sats back
+ * bit-for-bit, which is what makes the credit checkable rather than merely
+ * recorded. Pass 0.0 whenever credited_sats is 0. */
 int store_record_share_addr(store_t *s, const char *worker_name,
                             const char *payout_address,
                             uint64_t ts_ms, double difficulty,
-                            int is_block, const char *share_hash_or_null);
+                            int is_block, const char *share_hash_or_null,
+                            int64_t credited_sats, double rate_used);
 
 /* PPS credit: add delta_sats to the worker's accrued_sats in pps_credits.
  * Async (writer thread). delta_sats must be > 0. payout_address (the
@@ -57,6 +73,72 @@ int store_record_share_addr(store_t *s, const char *worker_name,
 int store_record_credit(store_t *s, const char *worker_name,
                         const char *payout_address,
                         uint64_t ts_ms, int64_t delta_sats);
+
+/* Publish what this proxy is actually paying, so the dashboard reads the
+ * effective rate from the running process instead of keeping its own copy
+ * of the config. Single-row upsert on id=1, synchronous (called at most
+ * once per template change, not per share).
+ *
+ * rate_source is "derived" or "override". gross is fair value before the
+ * fee; rate is net of it. effective_fee_bps is what the pair actually
+ * implies, which under an override need not equal fee_bps. */
+int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
+                           const char *rate_source,
+                           double rate_sats_per_diff,
+                           double gross_sats_per_diff,
+                           double effective_fee_bps,
+                           double network_difficulty,
+                           int64_t block_value_sats,
+                           uint64_t updated_ts_s);
+
+/* Append one row to the append-only rate log, unless the newest row already
+ * carries exactly these values — so the table grows with rate changes, not
+ * with template polls. Synchronous; called at most once per template change
+ * alongside store_record_pool_meta().
+ *
+ * This is the provenance half of the audit: shares.rate_used proves the
+ * arithmetic was applied consistently, and this proves the rate itself
+ * followed from the template and the configured fee. */
+int store_record_rate(store_t *s, const char *rate_source,
+                      double rate_sats_per_diff,
+                      double gross_sats_per_diff,
+                      int fee_bps,
+                      double network_difficulty,
+                      int64_t block_value_sats,
+                      uint64_t ts_s);
+
+/* One block template, as the pool received it. */
+typedef struct {
+    uint64_t    ts_s;
+    int         height;
+    const char *prev_hash;
+    const char *bits;                /* nbits as hex */
+    double      network_difficulty;
+    int64_t     coinbase_value_sats; /* subsidy + fees */
+    int         tx_count;
+    int64_t     tx_fees_sats;
+    /* "enforcer" when the backend dictated the coinbase (BIP22 coinbasetxn),
+     * "bitcoind" when we built our own. Only the former carries BIP300/301
+     * commitments, so only the former lets a sidechain be merge-mined. */
+    const char *source;
+    int         cb_spendable;        /* server coinbase outputs; 0 when we build it */
+    int         cb_op_returns;
+    int         longpoll;            /* server supports BIP22 long polling */
+    double      rate_sats_per_diff;  /* PPS rate derived from this template */
+} store_template_t;
+
+/* Record the template being mined. Synchronous; called once per poll.
+ *
+ * Keyed on what makes the *work* different — tip, nBits, source and coinbase
+ * shape. A poll matching the newest row updates that row in place (refreshing
+ * the block value, tx set and rate, bumping `polls` and `last_seen`) instead
+ * of appending: the block value drifts with every mempool tick, so keying on
+ * it appended a near-duplicate row per poll — thousands a day, nearly all of
+ * them fee churn at a height already recorded.
+ *
+ * Prunes history older than cfg.templates_retention_days when it opens a new
+ * row. */
+int store_record_template(store_t *s, const store_template_t *t);
 
 /* Record / refresh the upstream bitcoind tip the proxy is mining on.
  * Single-row upsert keyed on id=1. tip_observed_at is preserved when
@@ -82,6 +164,11 @@ typedef struct {
     uint64_t blocks_committed;
     uint64_t batches;
     uint64_t pg_errors;        /* poorly named; sqlite errors */
+    /* Events that left the ring but never reached the DB, after every
+     * commit retry failed. Accepted work that will never be credited —
+     * distinct from shares_dropped, which is enqueue-side overflow.
+     * Must be 0; anything else is a ledger shortfall against miners. */
+    uint64_t events_lost;
 } store_stats_t;
 void store_get_stats(store_t *s, store_stats_t *out);
 

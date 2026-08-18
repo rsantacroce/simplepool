@@ -40,33 +40,39 @@ typedef struct {
     char db_path[512];
     int  commit_window_ms;
     int  commit_max_shares;
+    int  templates_retention_days;  /* template history kept; 0 = forever */
 
     /* redis broadcast — optional. Empty url disables the module. */
     char redis_url[256];
     int  redis_publish_timeout_ms;
     int  redis_reconnect_backoff_ms;
 
-    /* PPS / Thunder mode. pool_mode = "solo" (default) preserves the
-     * existing per-block direct-payout flow. pool_mode = "pps" enables
-     * Thunder drivechain deposits in the coinbase and per-share PPS
-     * accrual in the database. */
-    char pool_mode[16];                       /* "solo" | "pps" | "pps-classic" */
-    /* pps-classic: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH), NOT
-     * the Thunder reserve. The operator later batches this BTC into Thunder
-     * via the admin dashboard's deposit action. Required when
-     * pool_mode = pps-classic; ignored otherwise. */
+    /* PPS mode. pool_mode = "solo" (default) preserves the per-block
+     * direct-payout flow: each miner's coinbase pays that miner. pool_mode
+     * = "pps-classic" pays every block into a single pool-owned BTC wallet
+     * and credits each accepted share to the worker's pps_credits row; the
+     * operator later batches that BTC into Thunder via the admin
+     * dashboard's deposit action, and the payout worker drains the Thunder
+     * reserve to miners. */
+    char pool_mode[16];                       /* "solo" | "pps-classic" */
+    /* pps-classic: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH) for
+     * the net-of-fee reward. Required when pool_mode = pps-classic;
+     * ignored otherwise. */
     char pool_btc_address[128];
-    char pool_thunder_reserve_address[128];   /* base58 Thunder address that
-                                               * receives every block's deposit
-                                               * — pps mode only, ignored in
-                                               * pps-classic */
-    int  thunder_sidechain_number;            /* 9 for Thunder */
-    /* OP_RETURN payload bytes following the OP_DRIVECHAIN output, hex-
-     * encoded. If empty, the configured pool_thunder_reserve_address is
-     * embedded as an ASCII string (matches Thunder's wallet behaviour). */
-    char thunder_op_return_hex[256];
-    /* PPS rate — sats credited per unit of share difficulty. Used by the
-     * payout worker downstream; the C proxy only computes accrued credits. */
+    /* PPS rate override — sats credited per unit of share difficulty.
+     *
+     * Leave unset (0) and the proxy derives the rate from each block
+     * template as (coinbasevalue / network_difficulty) * (1 - fee_bps/1e4).
+     * That is the recommended configuration: fee_bps becomes the single
+     * knob controlling the fee, and the rate tracks difficulty instead of
+     * going stale.
+     *
+     * Set it and the value is used verbatim and taken to be ALREADY NET of
+     * fee — fee_bps is not applied on top, because historically operators
+     * baked the fee into this number by hand. The proxy logs the fee that
+     * choice actually implies and warns when it disagrees with fee_bps.
+     * A static value silently drifts as difficulty moves, and can invert
+     * into paying miners more than the pool earns, so prefer derived. */
     double pps_sats_per_diff;
 
     /* logging */

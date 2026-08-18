@@ -3,8 +3,9 @@
  * The C proxy is the only writer to pps_credits.accrued_sats — every
  * accepted share INSERTs/UPSERTs with `accrued_sats = accrued_sats + delta`
  * via the writer thread. This worker is the only writer to
- * pps_credits.paid_sats, and only ever after a Thunder transaction has
- * been broadcast successfully.
+ * pps_credits.paid_sats, and only ever after a Thunder transaction has been
+ * observed CONFIRMED — not merely broadcast. `paid` therefore means settled,
+ * and `accrued - paid` is a liability the pool can still be held to.
  *
  * Both writers serialise through WAL with a generous busy_timeout, so
  * brief lock contention during the proxy's batch commit is invisible. */
@@ -95,15 +96,114 @@ export function finalizePayout(db, rowId, workerId, sats, feeSats, txid, nowSec)
     })();
 }
 
-/* Drop an in-flight row that we failed to broadcast — the Thunder RPC
- * threw before any txid was returned, so paid_sats was untouched and
- * the worker is safe to retry next tick. */
+/* Drop an in-flight row that we failed to broadcast — the Thunder RPC threw
+ * before any txid was returned, so paid_sats was untouched and the worker is
+ * safe to retry next tick. */
 export function abortPayout(db, rowId) {
     db.prepare(`DELETE FROM payouts_in_flight WHERE id = ?`).run(rowId);
 }
 
-/* Stuck in-flight rows older than `staleAfterSec`. Used at startup to
- * surface anything that needs operator attention; never auto-resolved. */
+/* ---------- batched payouts ------------------------------------------------
+ *
+ * One Thunder transaction pays many workers, so the in-flight rows for the
+ * whole batch have to appear and settle together. A per-worker finalize would
+ * leave a window where some workers are credited for a transaction the others
+ * are still "waiting" on — and a crash inside that window is unreconcilable,
+ * because the txid is the same for all of them. */
+
+export function beginBatch(db, items, nowSec) {
+    const ins = db.prepare(`
+        INSERT INTO payouts_in_flight (worker_id, sats, txid, started_at)
+        VALUES (?, ?, '', ?)
+    `);
+    return db.transaction(() =>
+        items.map(i => ins.run(i.worker_id, Number(i.sats), nowSec).lastInsertRowid)
+    )();
+}
+
+/* Stamp the txid onto a batch's in-flight rows, immediately after broadcast.
+ *
+ * This is deliberately NOT the finalize: broadcasting is not settling. The
+ * rows stay in payouts_in_flight — so listDue keeps skipping these workers,
+ * and nothing is credited — until the transaction is observed in a block.
+ * The txid is what lets the next tick ask whether that has happened. */
+export function attachBatchTxid(db, rowIds, txid) {
+    const upd = db.prepare('UPDATE payouts_in_flight SET txid = ? WHERE id = ?');
+    db.transaction(() => { for (const id of rowIds) upd.run(txid, id); })();
+}
+
+/* The batch currently awaiting confirmation, or null.
+ *
+ * Rows with txid='' are excluded: those are a crash between INSERT and
+ * broadcast, where we cannot tell whether anything went out. They are
+ * unresolvable from here and belong to listStuck and the operator, not to
+ * the settle path — inferring either way would risk paying twice or not at
+ * all. Only one batch can be outstanding, so the newest txid is the one. */
+export function pendingBatch(db) {
+    const rows = db.prepare(`
+        SELECT  p.id AS rowId, p.worker_id, p.sats, p.txid, p.started_at,
+                w.name AS worker_name
+        FROM    payouts_in_flight p
+        LEFT JOIN workers w ON w.id = p.worker_id
+        WHERE   p.txid IS NOT NULL AND p.txid != ''
+        ORDER BY p.id ASC
+    `).all();
+    if (rows.length === 0) return null;
+    const txid = rows[rows.length - 1].txid;
+    return {
+        txid,
+        started_at: rows[0].started_at,
+        rows: rows.filter(r => r.txid === txid)
+                  .map(r => ({ ...r, sats: BigInt(r.sats) })),
+    };
+}
+
+/* Credit every worker in the batch, atomically, against one txid.
+ *
+ * Called only once the transaction is confirmed. The transaction pays a
+ * single fee covering all recipients. It is divided evenly across the ledger
+ * rows with the remainder on the first, so SUM(payouts.fee_sats) equals what
+ * was actually spent — which is what any accounting query over that column
+ * assumes. */
+export function finalizeBatch(db, rows, totalFeeSats, txid, nowSec) {
+    const n = BigInt(rows.length);
+    const fee = BigInt(totalFeeSats);
+    const share = n > 0n ? fee / n : 0n;
+    const remainder = n > 0n ? fee - share * n : 0n;
+
+    db.transaction(() => {
+        rows.forEach((r, i) => {
+            const rowFee = share + (i === 0 ? remainder : 0n);
+            db.prepare('UPDATE payouts_in_flight SET txid = ? WHERE id = ?')
+              .run(txid, r.rowId);
+            db.prepare(`
+                UPDATE pps_credits
+                   SET paid_sats = paid_sats + ?, last_updated = ?
+                 WHERE worker_id = ?
+            `).run(Number(r.sats), nowSec, r.worker_id);
+            db.prepare(`
+                INSERT INTO payouts (worker_id, sats, fee_sats, txid, paid_at, note)
+                VALUES (?, ?, ?, ?, ?, ?)
+            `).run(r.worker_id, Number(r.sats), Number(rowFee), txid, nowSec,
+                   rows.length > 1 ? `batch of ${rows.length}` : null);
+            db.prepare('DELETE FROM payouts_in_flight WHERE id = ?').run(r.rowId);
+        });
+    })();
+}
+
+export function abortBatch(db, rowIds) {
+    const del = db.prepare('DELETE FROM payouts_in_flight WHERE id = ?');
+    db.transaction(() => { for (const id of rowIds) del.run(id); })();
+}
+
+/* In-flight rows older than `staleAfterSec` that need a human.
+ *
+ * Only rows with txid='' qualify. Since payouts settle on confirmation
+ * rather than on broadcast, a row WITH a txid is the ordinary waiting state —
+ * Thunder advances a handful of times a day, so those are routinely hours old
+ * and reporting them would be crying wolf on every restart. A row without one
+ * is the genuinely ambiguous case: we crashed around the broadcast and cannot
+ * tell whether it went out. Never auto-resolved. */
 export function listStuck(db, staleAfterSec, nowSec) {
     return db.prepare(`
         SELECT  p.id, p.worker_id, w.name AS worker_name,
@@ -112,6 +212,49 @@ export function listStuck(db, staleAfterSec, nowSec) {
         FROM    payouts_in_flight p
         JOIN    workers           w ON w.id = p.worker_id
         WHERE   p.started_at < ?
+          AND   (p.txid IS NULL OR p.txid = '')
         ORDER BY p.started_at ASC
     `).all(nowSec - staleAfterSec);
+}
+
+/* Record a broadcast attempt, successful or not, into tx_attempts.
+ *
+ * A failed payout previously left only a log line: the transaction that was
+ * built — the thing you actually need to diagnose a rejection — was
+ * discarded. This keeps it.
+ *
+ * Best-effort: logging must never change the outcome of the payout it is
+ * describing, so this swallows its own errors. In particular it must not
+ * throw on a database that predates the tx_attempts table. */
+export function recordTxAttempt(db, {
+    kind, status, stage = null, txid = null, rawTx = null,
+    amountSats = null, feeSats = null, destination = null,
+    workerId = null, error = null, detail = null,
+}) {
+    if (!db || typeof db.prepare !== 'function') return null;
+    try {
+        const info = db.prepare(`
+            INSERT INTO tx_attempts
+                (ts, kind, status, stage, txid, raw_tx, amount_sats, fee_sats,
+                 destination, worker_id, error, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(Math.floor(Date.now() / 1000), kind, status, stage, txid, rawTx,
+               amountSats === null ? null : Number(amountSats),
+               feeSats    === null ? null : Number(feeSats),
+               destination, workerId, error,
+               detail === null ? null
+                   : (typeof detail === 'string' ? detail : JSON.stringify(detail)));
+        return info.lastInsertRowid;
+    } catch {
+        return null;
+    }
+}
+
+/* Thunder's RPCs return transactions as JSON objects, not hex. Store a
+ * canonical JSON rendering so the operator has the exact bytes that were
+ * signed; fall back to a string as-is if a future version returns hex. */
+export function asRawTx(tx) {
+    if (tx == null) return null;
+    if (typeof tx === 'string') return tx;
+    try { return JSON.stringify(tx); } catch { return null; }
 }

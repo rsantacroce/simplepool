@@ -11,19 +11,19 @@ tracks:
   Thunder node. There's a one-shot deploy script; this doc also
   walks through what it does step by step so you can do it by hand.
 
-The doc is mode-agnostic where possible; where mode matters, the three
+The doc is mode-agnostic where possible; where mode matters, the two
 possibilities are called out clearly:
 
 - **`pool_mode = solo`**    — miners paid direct in the coinbase.
   Simplest. No drivechain, no Thunder, no PPS accrual.
-- **`pool_mode = pps`**     — drivechain deposit in every coinbase.
-  Empirically **does not credit Thunder** on the LayerTwo-Labs
-  enforcer (see [PPS_THUNDER.md](PPS_THUNDER.md)) — kept only as a
-  byte-level shape validator.
 - **`pool_mode = pps-classic`** — traditional coinbase paying a pool
   BTC address, operator-driven Thunder deposits from the admin
-  dashboard. This is the mode you actually want for a Thunder-paying
-  PPS pool. See [CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md).
+  dashboard. This is the mode you want for a Thunder-paying PPS pool.
+  See [CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md).
+
+(A third mode, `pool_mode = pps`, put the drivechain deposit directly in
+the coinbase. The enforcer never credited it, so it has been removed —
+`CLASSIC_PAYOUTS.md` has the evidence.)
 
 For an audit / theory refresher on nonce distribution and share math,
 see [NONCE_AND_SHARES.md](NONCE_AND_SHARES.md). For day-to-day
@@ -100,7 +100,7 @@ sudo apt install -y nodejs
 ### 1. Clone and build
 
 ```sh
-git clone https://github.com/rsantacroce/simplepool.git
+git clone https://github.com/LayerTwo-Labs/simplepool.git
 cd simplepool
 make
 ```
@@ -133,7 +133,7 @@ scripts/regtest/activate-thunder.sh  # proposes + acks sidechain #9
 scripts/regtest/thunder-init.sh      # generates a Thunder wallet + address
 scripts/regtest/validate.sh          # bootstraps 150 blocks, probes GBT
 node scripts/regtest/cpuminer.js --timeout 60  # actually mine a block
-scripts/regtest/inspect-coinbase.sh
+POOL_BTC_ADDRESS=<pool addr> scripts/regtest/inspect-coinbase.sh
 scripts/regtest/stop.sh
 ```
 
@@ -149,11 +149,93 @@ against it, they'll work against forknet or mainnet-drivechain.
 
 ## Part B — production install on Ubuntu
 
-Two paths: **the one-shot script** for a fresh Linux box, or the
-**manual walkthrough** if you're integrating simplepool into an
-existing setup.
+Three paths, in the order most people want them:
 
-### The one-shot deploy (fresh Ubuntu 24.04)
+1. **The installer** — run one line on the box. Interviews you, then does
+   everything below. This is Part B.1.
+2. **`deploy-to-server.sh`** — drive an already-installed box from your
+   workstation. For iterating on unreleased code. Part B.2.
+3. **The manual walkthrough** — every step by hand, for integrating into an
+   existing setup. Part B.3.
+
+### B.1 — the installer (fresh Ubuntu / Debian box)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scripts/install.sh | sudo bash
+```
+
+It asks where to install, which pool mode, your bitcoind RPC and addresses,
+the dashboard domain and admin password, and whether to set up nginx, TLS and
+the firewall — then does the whole install and prints what miners should
+connect to. Every answer is saved to `/etc/simplepool/install.env` and reused
+as the default next time, so **re-running it is how you change your mind**
+about any of them.
+
+#### Where the code comes from
+
+The first question is the one worth understanding:
+
+| | `release` (default) | `source` |
+| --- | --- | --- |
+| how | downloads the published tarball for this machine's architecture and verifies it against the release `SHA256SUMS` | `git clone` + `make` |
+| needs | curl, the runtime shared libraries | a C toolchain, git, and a few minutes |
+| gives you | exactly what CI built and tagged | any branch, any architecture |
+| upgrade | `simplepoolctl upgrade` | re-run with `--from-source` |
+
+Both end with the same tree at `$ROOT` — the release tarball *is* a checkout
+with a prebuilt `build/simplepool` and a `RELEASE` file in it. Everything
+after that step (config, database, systemd, nginx) is one code path, so a
+release box and a source box differ only in where the binary came from.
+
+Released binaries are built on Ubuntu 22.04, so they need **glibc 2.35 or
+newer** — Ubuntu 22.04+, Debian 12+. On anything older, or on an
+architecture with no published build, use `--from-source`.
+
+#### Non-interactive
+
+Every prompt has a flag, so the same script drives CI and re-runs:
+
+```sh
+sudo ./scripts/install.sh --non-interactive --yes \
+     --from-release \
+     --root /home/simplepool --user simplepool \
+     --mode pps-classic \
+     --operator-address bc1q... --pool-btc-address bc1q... \
+     --thunder-address <base58> \
+     --bitcoind-url http://127.0.0.1:8332 \
+     --bitcoind-user rpcuser --bitcoind-pass rpcpass \
+     --hostname pool.example.com --tls --email you@example.com \
+     --payout-interval-hours 24
+```
+
+`sudo ./scripts/install.sh --help` lists them all.
+
+#### Afterwards: `simplepoolctl`
+
+The installer drops `simplepoolctl` into `/usr/local/bin`. It reads the same
+`/etc/simplepool/install.env`, so it needs no configuration of its own:
+
+```sh
+simplepoolctl status            # services, ports, versions, ledger totals
+simplepoolctl doctor            # binary runs? bitcoind reachable? DB writable?
+simplepoolctl logs payout -f    # one service, or 'all' (the default)
+simplepoolctl config            # where every config file is, and what's in it
+sudo simplepoolctl restart proxy
+sudo simplepoolctl upgrade      # next release (or rebuild, on a source box)
+sudo simplepoolctl uninstall    # --purge also deletes the ledger
+```
+
+`doctor` is the one to run when something is wrong: it checks the binary
+actually executes on this machine, that `operator_address` (and
+`pool_btc_address` in pps-classic) are set, that the schema is loaded and the
+data directory is writable by the service user, that bitcoind answers
+`getblockchaininfo` with the configured credentials, and that something is
+listening on the stratum port.
+
+Once it is up, jump to **Part D** to review `proxy.conf` for your mode — the
+installer has already written the keys it asked about.
+
+### B.2 — deploy-to-server.sh (from your workstation)
 
 `scripts/deploy-to-server.sh` handles installing deps, cloning,
 building, initializing SQLite, dropping systemd units, and setting up
@@ -183,9 +265,9 @@ What it does (idempotent — re-run after every code change):
 After that runs cleanly, jump to **Part D** (configuring `proxy.conf`
 for your chosen mode) — everything else is already up.
 
-### Manual walkthrough
+### B.3 — manual walkthrough
 
-Skip if you ran the deploy script. Otherwise:
+Skip if you ran the installer or the deploy script. Otherwise:
 
 1. **Create a service user + workdir**:
    ```sh
@@ -197,7 +279,7 @@ Skip if you ran the deploy script. Otherwise:
    ```sh
    sudo -u simplepool -H bash -lc '
      cd /home/simplepool &&
-     git clone https://github.com/rsantacroce/simplepool.git . &&
+     git clone https://github.com/LayerTwo-Labs/simplepool.git . &&
      make -j$(nproc)
    '
    ```
@@ -308,7 +390,7 @@ simplepool talks to. Port `:50051` is the gRPC surface for
 sidechain management (used by the deposit runbook in
 [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md)).
 
-### Thunder (only for `pool_mode=pps` — optional in classic mode)
+### Thunder (needed for `pool_mode=pps-classic` payouts)
 
 Prebuilt: <https://releases.drivechain.info/L2-S9-Thunder-latest-aarch64-apple-darwin.zip>
 (no x86_64 Linux prebuilt as of this doc — build from source at
@@ -370,23 +452,6 @@ log_level = info
 ```
 
 Miner username: `<their BTC address>[.<rig_label>]`. Password ignored.
-
-### PPS mode (byte-shape validation only, does NOT actually pay Thunder)
-
-Only use if you're testing the drivechain coinbase output shape.
-
-```
-# ... same as solo, plus:
-pool_mode = pps
-pool_thunder_reserve_address = <base58 Thunder address>
-thunder_sidechain_number     = 9
-pps_sats_per_diff            = 1000
-# optional: override the OP_RETURN payload bytes
-# thunder_op_return_hex =
-```
-
-Miner username: `<their Thunder address>[.<rig_label>]`. Startup logs
-a WARN — that's intentional.
 
 ### PPS-classic mode
 
@@ -489,10 +554,15 @@ issuing Thunder transactions. Deploy as a systemd service:
 sudo mkdir -p /etc/systemd/system/simplepool-payout.service.d
 sudo tee /etc/systemd/system/simplepool-payout.service.d/local.conf <<'CONF'
 [Service]
-Environment=THUNDER_FROM_ADDRESS=<same as pool_thunder_reserve_address in proxy.conf>
+Environment=THUNDER_FROM_ADDRESS=<same as the dashboard's POOL_THUNDER_RESERVE_ADDRESS>
 # Below have defaults; override if you want:
 # Environment=PAYOUT_MIN_SATS=10000
-# Environment=PAYOUT_INTERVAL_MS=30000
+# Payout runs are a daily batch (24h). The settle clock is separate on
+# purpose: a batch already broadcast is re-checked every 30s, because
+# nobody in it is credited until a tick sees it in a Thunder block.
+# Environment=PAYOUT_INTERVAL_MS=86400000
+# Environment=PAYOUT_SETTLE_INTERVAL_MS=30000
+# Environment=PAYOUT_RETRY_INTERVAL_MS=300000
 # Environment=PAYOUT_MAX_PER_TICK=50
 CONF
 sudo systemctl daemon-reload
@@ -501,8 +571,8 @@ sudo journalctl -u simplepool-payout.service -f
 ```
 
 The worker is idle when the Thunder reserve has no funds — it logs
-`payout: reserve short — available=0 needed=N` every tick and skips
-harmlessly. See the deposit runbook in
+`payout: reserve short — available=0 needed=N` and skips harmlessly,
+retrying on the 5-minute retry clock rather than the daily one. See the deposit runbook in
 [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md) for how to actually fund it.
 
 For dry-run (see the exact payout it WOULD send without doing it),
@@ -516,6 +586,7 @@ sudo -u simplepool -H bash -lc '
   THUNDER_RPC_URL=http://127.0.0.1:6009 \
   THUNDER_FROM_ADDRESS=any \
   PAYOUT_INTERVAL_MS=2000 \
+  PAYOUT_SETTLE_INTERVAL_MS=2000 \
   node index.js
 '
 ```
@@ -619,7 +690,7 @@ Install-time trouble usually falls into one of these:
 - Running the pool day-to-day: [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md)
 - Auditing the numbers: [NONCE_AND_SHARES.md](NONCE_AND_SHARES.md)
 - Design rationale for pps-classic vs pps:
-  [CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md), [PPS_THUNDER.md](PPS_THUNDER.md)
+  [CLASSIC_PAYOUTS.md](CLASSIC_PAYOUTS.md)
 - Regtest full walk-through:
   [scripts/regtest/README.md](scripts/regtest/README.md)
 - Branch-level test plan: [VERIFY.md](VERIFY.md)

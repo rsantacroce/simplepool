@@ -10,13 +10,27 @@ CREATE TABLE IF NOT EXISTS workers (
   payout_address  TEXT
 );
 
+-- credited_sats is what the share was ACTUALLY credited when it was
+-- accepted. The PPS rate is derived per-template and moves with network
+-- difficulty, so recomputing historical shares against a current rate
+-- misreports them. Audits must sum this column, not re-derive it.
+-- 0 in solo mode, and 0 on rows written before the column existed
+-- (see pool_meta.credited_from for where it becomes trustworthy).
+-- rate_used is the exact rate the proxy multiplied by to get credited_sats.
+-- Storing it alongside the result is what makes the credit *verifiable*
+-- rather than merely recorded: an auditor can recompute
+-- CAST(difficulty * rate_used AS INTEGER) and must get credited_sats back,
+-- with no need to know what the rate happened to be at that moment.
+-- 0 in solo mode and on rows written before the column existed.
 CREATE TABLE IF NOT EXISTS shares (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  worker_id   INTEGER NOT NULL REFERENCES workers(id),
-  ts          INTEGER NOT NULL,
-  difficulty  REAL NOT NULL,
-  is_block    INTEGER NOT NULL DEFAULT 0,
-  block_hash  TEXT
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  worker_id     INTEGER NOT NULL REFERENCES workers(id),
+  ts            INTEGER NOT NULL,
+  difficulty    REAL NOT NULL,
+  is_block      INTEGER NOT NULL DEFAULT 0,
+  block_hash    TEXT,
+  credited_sats INTEGER NOT NULL DEFAULT 0,
+  rate_used     REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS shares_ts_idx ON shares(ts);
 CREATE INDEX IF NOT EXISTS shares_worker_ts_idx ON shares(worker_id, ts);
@@ -52,6 +66,102 @@ CREATE TABLE IF NOT EXISTS node_status (
   tip_observed_at INTEGER,  /* unix seconds — when we first saw this tip */
   updated_at      INTEGER   /* unix seconds — last successful poll */
 );
+
+/* Single source of truth for what the running proxy is actually paying.
+ *
+ * The dashboard MUST read the rate from here rather than from its own
+ * config or environment — holding the same number in two places is how an
+ * audit ends up disagreeing with the ledger it exists to check.
+ *
+ * rate_source is 'derived' (computed from the live template and fee_bps —
+ * the default and recommended setup) or 'override' (operator pinned
+ * pps_sats_per_diff, which is taken NET of fee and bypasses fee_bps).
+ * effective_fee_bps is what the numbers actually imply, which under an
+ * override can differ from the configured fee_bps.
+ *
+ * credited_from is stamped once, on first write, and marks the point from
+ * which shares.credited_sats is populated. */
+CREATE TABLE IF NOT EXISTS pool_meta (
+  id                  INTEGER PRIMARY KEY CHECK (id = 1),
+  pool_mode           TEXT,
+  fee_bps             INTEGER,
+  rate_source         TEXT,     /* 'derived' | 'override' */
+  rate_sats_per_diff  REAL,     /* effective, net of fee; 0 in solo */
+  gross_sats_per_diff REAL,     /* fair value before fee */
+  effective_fee_bps   REAL,
+  network_difficulty  REAL,
+  block_value_sats    INTEGER,
+  credited_from       INTEGER,
+  /* Mirror of the proxy's in-memory events_lost counter: accepted shares that
+   * never reached the DB after every commit retry failed. Must be 0 — it is
+   * work a miner was told was accepted and that no query can otherwise see. */
+  events_lost         INTEGER NOT NULL DEFAULT 0,  /* unix seconds */
+  updated_at          INTEGER   /* unix seconds */
+);
+
+/* Append-only log of every distinct PPS rate the proxy has paid at.
+ *
+ * pool_meta holds one row and is overwritten on every template, so the rate
+ * a share was credited at is not recoverable from it after the fact. This
+ * table keeps the provenance: what the rate was, and the inputs it was
+ * derived from, so an auditor can check the rate itself was fair — not just
+ * that the arithmetic was applied consistently (which shares.rate_used
+ * already proves on its own).
+ *
+ * A row is appended only when the tuple actually changes, so on a chain with
+ * a quiet mempool this stays small; on a busy one it approaches one row per
+ * template. Safe to prune: per-share verification does not depend on it. */
+CREATE TABLE IF NOT EXISTS rate_history (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                  INTEGER NOT NULL,  /* unix seconds, when it took effect */
+  rate_sats_per_diff  REAL    NOT NULL,  /* net of fee — matches shares.rate_used */
+  gross_sats_per_diff REAL    NOT NULL,  /* fair value before fee */
+  fee_bps             INTEGER NOT NULL,
+  network_difficulty  REAL    NOT NULL,
+  block_value_sats    INTEGER NOT NULL,
+  rate_source         TEXT    NOT NULL   /* 'derived' | 'override' */
+);
+CREATE INDEX IF NOT EXISTS rate_history_ts_idx   ON rate_history(ts);
+CREATE INDEX IF NOT EXISTS rate_history_rate_idx ON rate_history(rate_sats_per_diff);
+
+/* What the pool is actually mining, and what it mined before.
+ *
+ * One row per materially distinct template: a new tip, new nBits, a different
+ * source or a different coinbase shape opens a row. Repeated polls fold into
+ * the row they match, refreshing the block value / tx set / rate and bumping
+ * `polls` and `last_seen`, so each row is the *span* over which one template
+ * was mined rather than a single instant. The block value is deliberately not
+ * part of that identity — it drifts with every mempool tick, and keying on it
+ * appended a near-duplicate row per poll, thousands a day of fee churn at a
+ * height already recorded.
+ *
+ * `source` records where the template came from. 'enforcer' means the backend
+ * dictated the coinbase (BIP22 "coinbasetxn"), which is how the mandatory
+ * BIP300/301 commitments reach the block; 'bitcoind' means the pool built its
+ * own coinbase and the block carries none. `cb_op_returns` makes that concrete:
+ * one is a bare witness commitment, more means sidechain commitments are
+ * present. A pool mining 'bitcoind' templates cannot have any sidechain
+ * merge-mined into its blocks, which is invisible from every other view. */
+CREATE TABLE IF NOT EXISTS templates (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                  INTEGER NOT NULL,  /* unix seconds, first seen */
+  height              INTEGER NOT NULL,  /* height this template builds */
+  prev_hash           TEXT    NOT NULL,
+  bits                TEXT    NOT NULL,  /* nbits, hex */
+  network_difficulty  REAL    NOT NULL,
+  coinbase_value_sats INTEGER NOT NULL,  /* subsidy + fees */
+  tx_count            INTEGER NOT NULL,
+  tx_fees_sats        INTEGER NOT NULL,
+  source              TEXT    NOT NULL,  /* 'enforcer' | 'bitcoind' */
+  cb_spendable        INTEGER NOT NULL,  /* coinbase outputs, 0 when we build it */
+  cb_op_returns       INTEGER NOT NULL,
+  longpoll            INTEGER NOT NULL,  /* 1 when the server long-polls */
+  rate_sats_per_diff  REAL    NOT NULL,  /* PPS rate derived from this template */
+  last_seen           INTEGER NOT NULL DEFAULT 0,  /* unix seconds, last poll */
+  polls               INTEGER NOT NULL DEFAULT 1   /* polls folded into this row */
+);
+CREATE INDEX IF NOT EXISTS templates_ts_idx     ON templates(ts);
+CREATE INDEX IF NOT EXISTS templates_height_idx ON templates(height);
 
 /* PPS accrual ledger. One row per worker. The C proxy only INCREMENTs
  * accrued_sats; a separate payout service updates paid_sats after
@@ -119,3 +229,33 @@ CREATE TABLE IF NOT EXISTS payouts_in_flight (
   started_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS payouts_in_flight_worker_idx ON payouts_in_flight(worker_id);
+
+/* Every attempt to broadcast a transaction, successful or not. Owned by the
+ * dashboard and the payout worker; the C proxy never writes here.
+ *
+ * `deposits` and `payouts` record what actually happened. A failed broadcast
+ * is neither, but it is the thing an operator most needs to see — so it
+ * lands here instead, with the raw transaction whenever it can be recovered.
+ * Without this a failure left nothing behind but a truncated flash message.
+ *
+ * raw_tx is the full hex when obtainable. For a deposit that failed at
+ * broadcast the enforcer has still signed and stored the tx, so it can be
+ * recovered afterwards via ListSidechainDepositTransactions; `stage` records
+ * how far the attempt got. */
+CREATE TABLE IF NOT EXISTS tx_attempts (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts          INTEGER NOT NULL,   /* unix seconds */
+  kind        TEXT    NOT NULL,   /* 'deposit' | 'payout' */
+  status      TEXT    NOT NULL,   /* 'broadcast' | 'failed' */
+  stage       TEXT,               /* step reached when it failed */
+  txid        TEXT,
+  raw_tx      TEXT,               /* full hex, when recoverable */
+  amount_sats INTEGER,
+  fee_sats    INTEGER,
+  destination TEXT,
+  worker_id   INTEGER,            /* payouts only */
+  error       TEXT,               /* full, never truncated */
+  detail      TEXT                /* JSON: request params */
+);
+CREATE INDEX IF NOT EXISTS tx_attempts_ts_idx   ON tx_attempts(ts);
+CREATE INDEX IF NOT EXISTS tx_attempts_kind_idx ON tx_attempts(kind, ts);

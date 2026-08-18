@@ -8,6 +8,12 @@ bitcoind_url = http://127.0.0.1:18443
 # rpcpassword (cookie auth is not supported).
 bitcoind_user = drivepool
 bitcoind_pass = drivepool
+# How often to re-fetch the block template. On a drivechain pool this is also
+# the worst-case delay before a sidechain's BMM request reaches a stratum job:
+# a sidechain publishes its BMM transaction only after it sees the new tip, so
+# any block found within one poll of that cannot carry the commitment. Lower it
+# (5000-10000) if sidechains need to merge-mine reliably; the cost is one extra
+# getblocktemplate call per interval.
 bitcoind_poll_interval_ms = 30000
 
 # Miners are paid directly: the stratum username must be the miner's
@@ -31,6 +37,12 @@ db_path = ./data/shares.db
 commit_window_ms = 100
 commit_max_shares = 100
 
+# Days of template history to keep on the /templates page. One row is kept per
+# materially distinct template, so this is roughly one row per block plus one
+# per source/commitment change — set 0 to keep everything. Only the dashboard
+# reads this table; the ledger lives in shares and rate_history.
+templates_retention_days = 30
+
 # Redis broadcast (optional). When set, accepted shares / rejects / blocks /
 # tip changes are PUBLISHed on channels pool:shares / pool:rejects /
 # pool:blocks / pool:tip as JSON. SQLite remains the source of truth — the
@@ -43,29 +55,28 @@ redis_reconnect_backoff_ms = 2000
 # pool_mode controls the coinbase shape and the username validation:
 #   solo        default. Coinbase pays the miner (stratum username is a
 #               BTC address) minus the operator fee. No PPS accrual.
-#   pps         Every block's coinbase carries a BIP300 drivechain deposit
-#               output for the configured pool_thunder_reserve_address.
-#               Miners authorize with a Thunder address (base58 of a
-#               20-byte hash). WARNING: the LayerTwo-Labs enforcer does
-#               not credit coinbase-source deposits; this mode produces a
-#               well-formed but effectively unspendable OP_DRIVECHAIN
-#               output. Kept for shape-validation only.
 #   pps-classic Coinbase pays a pool BTC address (pool_btc_address below)
 #               as a normal P2WPKH/P2PKH output. Miners authorize with a
-#               Thunder address and accrue in pps_credits, same as pps.
-#               The operator batches accumulated BTC into Thunder from
-#               the admin dashboard.
+#               Thunder address (base58 of a 20-byte hash) and accrue in
+#               pps_credits. The operator batches accumulated BTC into
+#               Thunder from the admin dashboard, and the payout worker
+#               drains that reserve to miners.
 pool_mode = solo
 
-# pps-classic
+# pps-classic — required
 # pool_btc_address = REPLACE_WITH_POOL_BTC_ADDRESS
 
-# pps (only)
-# pool_thunder_reserve_address = REPLACE_WITH_BASE58_THUNDER_ADDRESS
-# thunder_sidechain_number = 9
-# thunder_op_return_hex =         # optional override; else ASCII of the address
-
-# pps + pps-classic — sats credited per unit of share difficulty
+# pps-classic — OPTIONAL rate override, sats credited per unit of share
+# difficulty. Leave it commented out and the proxy derives the rate from each
+# block template as (coinbasevalue / network_difficulty) * (1 - fee_bps/1e4).
+# That is the recommended setup: fee_bps becomes the single knob controlling
+# the fee, and the rate follows difficulty instead of going stale.
+#
+# If you do set it, the value is used verbatim and treated as ALREADY NET of
+# fee — fee_bps is NOT applied on top. A fixed rate drifts as difficulty
+# moves and can invert into paying miners more than each share earns, so the
+# proxy logs the fee your value actually implies and warns when it disagrees
+# with fee_bps. Prefer leaving it unset.
 # pps_sats_per_diff = 1000
 
 log_level = info

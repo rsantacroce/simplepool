@@ -7,9 +7,12 @@
 #include "share.h"
 #include "store.h"
 #include "stratum.h"
+#include "version.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,6 +112,11 @@ static size_t compute_merkle_branches_for_idx0(const uint8_t (*txids_le)[32],
 
 typedef struct {
     bitcoind_client_t *btc;
+    /* Dedicated client for the tip watcher's (possibly long-polled) GBT
+     * requests. A BIP22 long poll parks the request server-side for tens of
+     * seconds while holding the client's connection lock — on the shared
+     * client that would stall submitblock, so the watcher gets its own. */
+    bitcoind_client_t *btc_lp;
     store_t           *store;
     broadcast_t       *bcast;
     stratum_server_t  *srv;
@@ -118,7 +126,25 @@ typedef struct {
     int             last_height;
     char            last_prev_hash[65];
     uint64_t        last_built_ms;
+
+    /* Live PPS rate, refreshed whenever a new template arrives. Read on the
+     * share path, so it is an atomic double rather than taking `lock` —
+     * a share crediting against the previous template's rate for a few
+     * microseconds during a swap is immaterial, whereas contending the job
+     * lock per share would not be. Zero means "no accrual" (solo, or a
+     * template we could not derive a rate from). */
+    _Atomic double  pps_rate;
 } server_ctx_t;
+
+/* The rate this proxy will credit at: the operator's override verbatim if
+ * set, otherwise fair value derived from the template. See the
+ * pps_sats_per_diff commentary in config.h for why an override bypasses
+ * fee_bps rather than stacking with it. */
+static double effective_pps_rate(const proxy_config_t *cfg,
+                                 int64_t value_sats, double net_diff) {
+    if (cfg->pps_sats_per_diff > 0.0) return cfg->pps_sats_per_diff;
+    return pps_rate_from_template(value_sats, net_diff, cfg->fee_bps);
+}
 
 /* Build a job from a freshly fetched template. The coinbase is rendered
  * per-connection inside stratum.c (each miner pays their own address),
@@ -228,6 +254,114 @@ static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
     return job;
 }
 
+/* Recompute the PPS rate from a new template and publish it, so the
+ * dashboard reads what is actually being paid instead of keeping a second
+ * copy of the config. Cheap and called once per template change.
+ *
+ * Warns when an override implies a materially different fee from fee_bps —
+ * that mismatch is invisible otherwise, and a stale override is how the fee
+ * silently drifts to zero (or negative) as difficulty moves. */
+static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
+    if (!s || !s->cfg || !t) return;
+
+    uint8_t target_be[32] = {0};
+    if (t->target_hex[0] != '\0' && strlen(t->target_hex) == 64) {
+        if (hex_to_bytes_display(t->target_hex, target_be, 32) < 0)
+            nbits_to_target(t->bits, target_be);
+    } else {
+        nbits_to_target(t->bits, target_be);
+    }
+    double net_diff = target_to_diff(target_be);
+    int64_t value   = t->coinbase_value_sats;
+
+    int overridden  = s->cfg->pps_sats_per_diff > 0.0;
+    double rate     = effective_pps_rate(s->cfg, value, net_diff);
+    double gross    = (value > 0 && isfinite(net_diff) && net_diff > 0.0)
+                    ? (double)value / net_diff : 0.0;
+    /* What the numbers actually imply, which under an override is whatever
+     * the operator's arithmetic produced rather than fee_bps. */
+    double eff_fee_bps = (gross > 0.0) ? (1.0 - rate / gross) * 10000.0 : 0.0;
+
+    int accrues = strcmp(s->cfg->pool_mode, "pps-classic") == 0;
+    atomic_store_explicit(&s->pps_rate, accrues ? rate : 0.0,
+                          memory_order_relaxed);
+
+    if (accrues && overridden && gross > 0.0) {
+        double drift = eff_fee_bps - (double)s->cfg->fee_bps;
+        if (drift < -25.0 || drift > 25.0) {
+            LOG_WARN("pps rate override %.4f implies a %.2f%% fee, but "
+                     "fee_bps=%d says %.2f%% (network difficulty %.2f, "
+                     "block value %lld sats). Fair value is %.4f sats/diff. "
+                     "Omit pps_sats_per_diff to derive it automatically.",
+                     s->cfg->pps_sats_per_diff, eff_fee_bps / 100.0,
+                     s->cfg->fee_bps, s->cfg->fee_bps / 100.0,
+                     net_diff, (long long)value,
+                     gross * (1.0 - (double)s->cfg->fee_bps / 10000.0));
+        }
+        if (eff_fee_bps < 0.0) {
+            LOG_WARN("pps rate override %.4f EXCEEDS fair value %.4f — the "
+                     "pool is paying out more than each share earns.",
+                     s->cfg->pps_sats_per_diff, gross);
+        }
+    }
+
+    if (s->store) {
+        uint64_t now_s = (uint64_t)time(NULL);
+        store_record_pool_meta(s->store, s->cfg->pool_mode, s->cfg->fee_bps,
+                               overridden ? "override" : "derived",
+                               accrues ? rate : 0.0, gross,
+                               accrues ? eff_fee_bps : 0.0,
+                               net_diff, value, now_s);
+        /* Append to the rate log so the rate a share was credited at stays
+         * recoverable after pool_meta has been overwritten. Only meaningful
+         * while accruing — in solo mode the effective rate is 0 and there is
+         * nothing to audit. */
+        if (accrues) {
+            store_record_rate(s->store, overridden ? "override" : "derived",
+                              rate, gross, s->cfg->fee_bps,
+                              net_diff, value, now_s);
+        }
+
+        /* Template history. Recorded in every mode — what the pool is mining
+         * is worth showing whether or not it accrues PPS credit. */
+        int cb_spendable = 0, cb_op_returns = 0;
+        if (t->coinbasetxn_hex) {
+            /* Best-effort: a coinbase we cannot parse still gets a row, just
+             * with zero counts, rather than losing the whole template. */
+            if (coinbase_count_outputs(t->coinbasetxn_hex,
+                                       &cb_spendable, &cb_op_returns) < 0) {
+                cb_spendable = 0;
+                cb_op_returns = 0;
+            }
+        }
+        int64_t tx_fees = 0;
+        for (size_t i = 0; i < t->tx_count; i++) {
+            if (t->txs[i].fee > 0) tx_fees += t->txs[i].fee;
+        }
+        char bits_hex[16];
+        snprintf(bits_hex, sizeof bits_hex, "%08x", t->bits);
+
+        store_template_t st = {
+            .ts_s                = now_s,
+            .height              = t->height,
+            .prev_hash           = t->prev_hash_hex,
+            .bits                = bits_hex,
+            .network_difficulty  = net_diff,
+            .coinbase_value_sats = value,
+            .tx_count            = (int)t->tx_count,
+            .tx_fees_sats        = tx_fees,
+            /* A server-provided coinbase is the signal: only that path
+             * carries the BIP300/301 commitments. */
+            .source              = t->coinbasetxn_hex ? "enforcer" : "bitcoind",
+            .cb_spendable        = cb_spendable,
+            .cb_op_returns       = cb_op_returns,
+            .longpoll            = t->longpollid != NULL,
+            .rate_sats_per_diff  = accrues ? rate : 0.0,
+        };
+        store_record_template(s->store, &st);
+    }
+}
+
 /* ---------- observer hooks ---------- */
 
 static void on_share_cb(void *ctx, const char *worker_name,
@@ -235,37 +369,56 @@ static void on_share_cb(void *ctx, const char *worker_name,
                         double difficulty, int is_block,
                         const char *block_hash_or_null) {
     server_ctx_t *s = (server_ctx_t *)ctx;
+
+    /* PPS accrual. Credit the worker proportional to share difficulty at the
+     * rate derived from the current template (or the operator's override).
+     * Truncates to whole sats; sub-sat dust accumulates per-share so over
+     * many shares the rounding error is bounded by 1 sat per row.
+     *
+     * Only pool_mode=pps-classic accrues. Solo pays each miner directly from
+     * their own coinbase, so there is nothing to credit and delta stays 0 —
+     * which is also what gets stored on the share row.
+     *
+     * Computed before the share is recorded so the amount can be written
+     * onto the share itself; an audit then reports what was paid rather than
+     * recomputing it against a rate that may since have moved. */
+    int64_t delta = 0;
+    double  rate_used = 0.0;
+    if (s && s->cfg && strcmp(s->cfg->pool_mode, "pps-classic") == 0) {
+        double rate = atomic_load_explicit(&s->pps_rate, memory_order_relaxed);
+        if (rate > 0.0) {
+            double d = difficulty * rate;
+            /* rate_used is stored only when it is the number that actually
+             * produced delta. On the overflow guard below the two would not
+             * reconcile, so it stays 0 and the audit reports the row as
+             * unverifiable instead of as a mismatch. */
+            if (d > 0.0 && d < (double)INT64_MAX) {
+                delta = (int64_t)d;
+                rate_used = rate;
+            }
+        }
+    }
+
     if (s && s->store) {
         store_record_share_addr(s->store, worker_name, payout_address,
                                 ts_ms, difficulty, is_block,
-                                block_hash_or_null);
+                                block_hash_or_null, delta, rate_used);
     }
     if (s && s->bcast) {
         broadcast_share(s->bcast, worker_name, payout_address,
                         ts_ms, difficulty, is_block, block_hash_or_null);
     }
-    /* PPS accrual. Credit the worker proportional to share difficulty.
-     * Truncates to whole sats; sub-sat dust accumulates per-share so
-     * over many shares the rounding error is bounded by 1 sat per row.
-     * Fires for both pool_mode=pps (drivechain coinbase) and pool_mode=
-     * pps-classic (traditional coinbase, operator-driven deposits). */
-    if (s && s->cfg &&
-        (strcmp(s->cfg->pool_mode, "pps") == 0 ||
-         strcmp(s->cfg->pool_mode, "pps-classic") == 0) &&
-        s->cfg->pps_sats_per_diff > 0.0) {
-        int64_t delta = (int64_t)(difficulty * s->cfg->pps_sats_per_diff);
-        if (delta > 0) {
-            if (s->store) {
-                store_record_credit(s->store, worker_name, payout_address,
-                                    ts_ms, delta);
-            }
-            if (s->bcast) {
-                /* accrued_total is the running balance after this credit.
-                 * Since the writer thread is async we don't know it
-                 * exactly; pass 0 and let consumers query SQLite for the
-                 * authoritative number. */
-                broadcast_credit(s->bcast, worker_name, ts_ms, delta, 0);
-            }
+    if (delta > 0) {
+        if (s->store) {
+            store_record_credit(s->store, worker_name, payout_address,
+                                ts_ms, delta);
+        }
+        if (s->bcast) {
+            /* accrued_total is the running balance after this credit.
+             * Since the writer thread is async we don't know it
+             * exactly; pass 0 and let consumers query SQLite for the
+             * authoritative number. */
+            broadcast_credit(s->bcast, worker_name, ts_ms, delta, 0);
         }
     }
 }
@@ -318,19 +471,45 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
 
 static void *tip_watcher(void *arg) {
     server_ctx_t *s = (server_ctx_t *)arg;
+    /* BIP22 long-poll token from the previous template. While set, requests
+     * are parked server-side until the template goes stale, so the loop
+     * needs no sleep — the response IS the new-tip notification. Empty means
+     * the server doesn't long poll (e.g. stock bitcoind config without it,
+     * or an older enforcer) and we fall back to interval polling. */
+    char lpid[128] = {0};
+    int consec_errs = 0;
     while (!g_shutdown) {
-        struct timespec ts;
-        ts.tv_sec  = s->cfg->bitcoind_poll_interval_ms / 1000;
-        ts.tv_nsec = (long)(s->cfg->bitcoind_poll_interval_ms % 1000) * 1000000L;
-        nanosleep(&ts, NULL);
+        if (lpid[0] == '\0') {
+            uint64_t delay_ms = (uint64_t)s->cfg->bitcoind_poll_interval_ms;
+            if (consec_errs > 0) {
+                /* BIP22: failed requests SHOULD be retried with exponential
+                 * backoff — retrying with no real delay is explicitly
+                 * forbidden, and matters when the configured poll interval
+                 * is aggressive (e.g. 10ms). 1s doubling to a 32s cap. */
+                int shift = consec_errs - 1 < 5 ? consec_errs - 1 : 5;
+                uint64_t backoff_ms = 1000ULL << shift;
+                if (backoff_ms > delay_ms) delay_ms = backoff_ms;
+            }
+            struct timespec ts;
+            ts.tv_sec  = (time_t)(delay_ms / 1000);
+            ts.tv_nsec = (long)(delay_ms % 1000) * 1000000L;
+            nanosleep(&ts, NULL);
+        }
         if (g_shutdown) break;
 
         char err[512] = {0};
         bitcoind_template_t *t = NULL;
-        if (bitcoind_get_block_template(s->btc, &t, err, sizeof err) < 0) {
-            LOG_WARN("getblocktemplate poll failed: %s", err);
+        if (bitcoind_get_block_template_lp(s->btc_lp, lpid[0] ? lpid : NULL,
+                                           &t, err, sizeof err) < 0) {
+            LOG_WARN("getblocktemplate %s failed: %s",
+                     lpid[0] ? "long poll" : "poll", err);
+            /* Drop to poll mode: the nanosleep above paces the retries, and
+             * a server that stopped long polling is handled gracefully. */
+            lpid[0] = '\0';
+            if (consec_errs < 16) consec_errs++;
             continue;
         }
+        consec_errs = 0;
 
         /* GBT returns the height of the NEXT block to mine and the hash
          * of the current tip in prev_hash_hex. Mirror that into the DB
@@ -364,6 +543,9 @@ static void *tip_watcher(void *arg) {
                 continue;
             }
             stratum_server_set_job(s->srv, job);
+            /* Difficulty and block value move with the template, so the
+             * rate has to move with it too. */
+            refresh_pps_rate(s, t);
             pthread_mutex_lock(&s->lock);
             s->last_height = t->height;
             snprintf(s->last_prev_hash, sizeof s->last_prev_hash, "%s",
@@ -372,6 +554,14 @@ static void *tip_watcher(void *arg) {
             pthread_mutex_unlock(&s->lock);
             LOG_INFO("new job: height=%d prev=%.16s... txs=%zu",
                      t->height, t->prev_hash_hex, t->tx_count);
+        }
+        if (t->longpollid) {
+            if (lpid[0] == '\0') {
+                LOG_INFO("getblocktemplate long polling enabled");
+            }
+            snprintf(lpid, sizeof lpid, "%s", t->longpollid);
+        } else {
+            lpid[0] = '\0';
         }
         bitcoind_template_free(t);
     }
@@ -383,7 +573,8 @@ static void *tip_watcher(void *arg) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [config_path]\n"
-            "  config_path  path to proxy.conf (default ./proxy.conf)\n",
+            "  config_path  path to proxy.conf (default ./proxy.conf)\n"
+            "  --version    print build provenance (version, commit, branch)\n",
             prog);
 }
 
@@ -392,6 +583,10 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
             usage(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[1], "-V") == 0 || strcmp(argv[1], "--version") == 0) {
+            version_print();
             return 0;
         }
         cfg_path = argv[1];
@@ -423,7 +618,9 @@ int main(int argc, char **argv) {
         }
     }
     log_init(cfg.log_level);
-    LOG_INFO("simplepool starting (config=%s)", cfg_path);
+    /* The commit goes in the first log line so the journal records which build
+     * each run was, long after the binary has been replaced. */
+    LOG_INFO("%s starting (config=%s)", version_line(), cfg_path);
 
     /* bitcoind client. */
     bitcoind_client_t btc = {0};
@@ -434,6 +631,18 @@ int main(int argc, char **argv) {
     bcfg.timeout_ms = 10000;
     if (bitcoind_client_init(&btc, &bcfg) < 0) {
         fprintf(stderr, "bitcoind_client_init failed\n");
+        return 3;
+    }
+    /* Second client for the tip watcher (see server_ctx_t.btc_lp). A BIP22
+     * long poll parks server-side — 30s on the CUSF enforcer — so this
+     * client's timeout must comfortably exceed the server's window. */
+    bitcoind_client_t btc_lp = {0};
+    bitcoind_cfg_t bcfg_lp = bcfg;
+    bcfg_lp.timeout_ms = 90000;
+    if (bitcoind_client_init(&btc_lp, &bcfg_lp) < 0) {
+        fprintf(stderr, "bitcoind_client_init (long poll) failed\n");
+        bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
         return 3;
     }
     /* The ping is a getblockchaininfo sanity check. Some block-template
@@ -457,10 +666,12 @@ int main(int argc, char **argv) {
     snprintf(scfg.path, sizeof scfg.path, "%s", cfg.db_path);
     scfg.commit_window_ms  = cfg.commit_window_ms;
     scfg.commit_max_shares = cfg.commit_max_shares;
+    scfg.templates_retention_days = cfg.templates_retention_days;
     store_t *store = NULL;
     if (store_open(&scfg, &store) < 0) {
         fprintf(stderr, "store_open failed for %s\n", cfg.db_path);
         bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
         return 4;
     }
 
@@ -481,6 +692,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "initial GBT failed: %s\n", err);
         store_close(store);
         bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
         return 5;
     }
 
@@ -490,6 +702,7 @@ int main(int argc, char **argv) {
         bitcoind_template_free(tmpl);
         store_close(store);
         bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
         return 6;
     }
 
@@ -497,8 +710,9 @@ int main(int argc, char **argv) {
     server_ctx_t sctx;
     memset(&sctx, 0, sizeof sctx);
     pthread_mutex_init(&sctx.lock, NULL);
-    sctx.btc   = &btc;
-    sctx.store = store;
+    sctx.btc    = &btc;
+    sctx.btc_lp = &btc_lp;
+    sctx.store  = store;
     sctx.bcast = bcast;
     sctx.cfg   = &cfg;
     sctx.last_height = tmpl->height;
@@ -515,6 +729,10 @@ int main(int argc, char **argv) {
             broadcast_node_tip(bcast, tmpl->height - 1, tmpl->prev_hash_hex, now_s);
         }
     }
+
+    /* Seed the rate before any share can arrive — a share credited at 0
+     * would be silently unpaid. */
+    refresh_pps_rate(&sctx, tmpl);
 
     /* Start stratum server. */
     stratum_cfg_t stcfg;
@@ -535,19 +753,13 @@ int main(int argc, char **argv) {
     stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
     stcfg.idle_timeout_sec   = cfg.idle_timeout_sec;
 
-    /* PPS / Thunder. Both pps and pps-classic modes require Thunder-address
-     * usernames and produce PPS accruals; they differ only in the coinbase
-     * shape (drivechain vs traditional). */
-    static uint8_t pps_payload[80];
-    size_t pps_payload_len = 0;
-    stcfg.pps_enabled         = (strcmp(cfg.pool_mode, "pps")         == 0 ||
-                                 strcmp(cfg.pool_mode, "pps-classic") == 0);
-    stcfg.pps_classic_enabled = (strcmp(cfg.pool_mode, "pps-classic") == 0);
-    stcfg.thunder_sidechain_number = cfg.thunder_sidechain_number;
+    /* PPS. pool_mode=pps-classic takes Thunder-address usernames, pays every
+     * coinbase into the pool's BTC wallet, and accrues per-share credits. */
+    stcfg.pps_enabled = (strcmp(cfg.pool_mode, "pps-classic") == 0);
     snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",
              cfg.pool_btc_address);
 
-    if (stcfg.pps_classic_enabled) {
+    if (stcfg.pps_enabled) {
         /* Fail fast on a misconfigured pool_btc_address so we don't drop
          * every rendered job at runtime. */
         uint8_t spk[64];
@@ -562,45 +774,6 @@ int main(int argc, char **argv) {
         }
         LOG_INFO("pool_mode=pps-classic: pool_btc_address=%s, pps_sats_per_diff=%.2f",
                  cfg.pool_btc_address, cfg.pps_sats_per_diff);
-    } else if (stcfg.pps_enabled) {
-        /* pool_mode=pps — precompute the OP_RETURN bytes for the drivechain
-         * coinbase: either the explicit hex from config, or the ASCII of the
-         * pool's base58 Thunder address (matches Thunder's wallet behaviour). */
-        if (cfg.thunder_op_return_hex[0]) {
-            size_t hlen = strlen(cfg.thunder_op_return_hex);
-            if (hlen % 2 != 0 || hlen / 2 > sizeof pps_payload) {
-                fprintf(stderr, "config: invalid thunder_op_return_hex (length)\n");
-                return 9;
-            }
-            for (size_t i = 0; i < hlen / 2; i++) {
-                int hi = hex_nibble(cfg.thunder_op_return_hex[2*i]);
-                int lo = hex_nibble(cfg.thunder_op_return_hex[2*i + 1]);
-                if (hi < 0 || lo < 0) {
-                    fprintf(stderr, "config: invalid thunder_op_return_hex (chars)\n");
-                    return 9;
-                }
-                pps_payload[i] = (uint8_t)((hi << 4) | lo);
-            }
-            pps_payload_len = hlen / 2;
-        } else {
-            size_t alen = strlen(cfg.pool_thunder_reserve_address);
-            if (alen == 0 || alen > sizeof pps_payload) {
-                fprintf(stderr,
-                        "config: pool_thunder_reserve_address empty or too long\n");
-                return 9;
-            }
-            memcpy(pps_payload, cfg.pool_thunder_reserve_address, alen);
-            pps_payload_len = alen;
-        }
-        stcfg.pps_op_return_payload     = pps_payload;
-        stcfg.pps_op_return_payload_len = pps_payload_len;
-        LOG_WARN("pool_mode=pps: coinbase deposits will NOT credit the Thunder "
-                 "Ctip on the LayerTwo-Labs enforcer — this mode strands the "
-                 "block reward. Use pool_mode=pps-classic for real deployments.");
-        LOG_INFO("pool_mode=pps: sidechain=%d, op_return_payload=%zu bytes, "
-                 "pps_sats_per_diff=%.2f",
-                 cfg.thunder_sidechain_number, pps_payload_len,
-                 cfg.pps_sats_per_diff);
     }
     stcfg.ctx            = &sctx;
     stcfg.on_share       = on_share_cb;
@@ -615,6 +788,7 @@ int main(int argc, char **argv) {
         bitcoind_template_free(tmpl);
         store_close(store);
         bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
         return 7;
     }
     sctx.srv = srv;
@@ -651,11 +825,19 @@ int main(int argc, char **argv) {
     store_flush(store);
     store_stats_t stats;
     store_get_stats(store, &stats);
-    LOG_INFO("final stats: shares_committed=%llu rejects_committed=%llu blocks=%llu sqlite_errs=%llu",
+    LOG_INFO("final stats: shares_committed=%llu rejects_committed=%llu blocks=%llu sqlite_errs=%llu events_lost=%llu",
              (unsigned long long)stats.shares_committed,
              (unsigned long long)stats.rejects_committed,
              (unsigned long long)stats.blocks_committed,
-             (unsigned long long)stats.pg_errors);
+             (unsigned long long)stats.pg_errors,
+             (unsigned long long)stats.events_lost);
+    /* Loud and separate, because it is the one number here that means miners
+     * are owed work the ledger has no record of. Nothing else reports it. */
+    if (stats.events_lost > 0) {
+        LOG_ERROR("store: %llu accepted event(s) never reached the DB this run "
+                  "— those shares are uncredited and unrecoverable",
+                  (unsigned long long)stats.events_lost);
+    }
     store_close(store);
 
     if (bcast) {
@@ -672,6 +854,7 @@ int main(int argc, char **argv) {
     }
 
     bitcoind_client_free(&btc);
+    bitcoind_client_free(&btc_lp);
     pthread_mutex_destroy(&sctx.lock);
 
     LOG_INFO("simplepool exited cleanly");

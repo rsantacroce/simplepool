@@ -242,27 +242,36 @@ export function worker(handle, name, windowSec = 86400) {
         });
     }
 
-    /* Self-service PPS audit — same cross-check the admin view runs,
-     * but scoped to this one worker. Returns null in solo mode (no row
-     * in pps_credits). `rate` is passed in by the caller (from env). */
+    /* Self-service PPS audit — same cross-check the admin view runs, scoped
+     * to this one worker. Null in solo mode (no pps_credits row).
+     *
+     * The cross-check sums shares.credited_sats, which is what each share was
+     * actually credited when it was accepted. It is NOT recomputed from a
+     * current rate: the rate is derived per-template and moves with network
+     * difficulty, so re-deriving history would report a mismatch on every
+     * difficulty change. Rate metadata comes from pool_meta for display only. */
     let ppsAudit = null;
     const credit = d.prepare(`
         SELECT accrued_sats, paid_sats, last_updated
           FROM pps_credits WHERE worker_id = ?
     `).get(w.id);
     if (credit) {
-        const rate = Number(arguments[3] || 0);
+        const meta = poolMeta(d);
         const totals = d.prepare(`
-            SELECT COUNT(*)                                          AS share_count,
-                   COALESCE(SUM(difficulty), 0)                      AS sum_difficulty,
-                   COALESCE(SUM(CAST(difficulty * ? AS INTEGER)), 0) AS accrued_computed
+            SELECT COUNT(*)                            AS share_count,
+                   COALESCE(SUM(difficulty), 0)        AS sum_difficulty,
+                   COALESCE(SUM(credited_sats), 0)     AS accrued_computed
               FROM shares
              WHERE worker_id = ?
-        `).get(rate, w.id);
+        `).get(w.id);
         const accrued = Number(credit.accrued_sats || 0);
         const paid    = Number(credit.paid_sats    || 0);
         ppsAudit = {
-            rate,
+            rate: meta ? meta.rate_sats_per_diff : null,
+            meta,
+            /* Miners get the same re-derivation the operator sees — an audit
+             * only the pool can run is not much of an audit. */
+            verification: rateVerification(d, w.id),
             accrued, paid, owed: accrued - paid,
             last_updated: Number(credit.last_updated || 0),
             share_count:      Number(totals.share_count),
@@ -321,6 +330,222 @@ export function worker(handle, name, windowSec = 86400) {
 
 /* Latest tip the C proxy is mining on, mirrored from getblocktemplate.
  * Returns null if the proxy hasn't recorded a tip yet (fresh DB). */
+/* What the proxy is actually paying, straight from the row it writes on
+ * every template change. This is the ONLY place the dashboard should learn
+ * the rate — never from its own config, or the audit can disagree with the
+ * ledger it exists to check.
+ *
+ * Returns null on a DB predating pool_meta, in which case callers should
+ * present the rate as unknown rather than substituting a guess. */
+export function poolMeta(handle) {
+    /* Called from stats.js with a lazy handle and from admin.js with an
+     * already-resolved better-sqlite3 Database, so accept either rather
+     * than making callers remember which. */
+    const d = !handle ? null
+            : (typeof handle.get === 'function' ? handle.get() : handle);
+    if (!d) return null;
+    try {
+        const r = d.prepare(`
+            SELECT pool_mode, fee_bps, rate_source, rate_sats_per_diff,
+                   gross_sats_per_diff, effective_fee_bps, network_difficulty,
+                   block_value_sats, credited_from, updated_at
+              FROM pool_meta WHERE id = 1
+        `).get();
+        if (!r) return null;
+        const gross = Number(r.gross_sats_per_diff || 0);
+        const rate  = Number(r.rate_sats_per_diff  || 0);
+        return {
+            pool_mode:           r.pool_mode || 'solo',
+            fee_bps:             Number(r.fee_bps || 0),
+            rate_source:         r.rate_source || 'derived',
+            rate_sats_per_diff:  rate,
+            gross_sats_per_diff: gross,
+            effective_fee_bps:   Number(r.effective_fee_bps || 0),
+            network_difficulty:  Number(r.network_difficulty || 0),
+            block_value_sats:    Number(r.block_value_sats || 0),
+            credited_from:       Number(r.credited_from || 0),
+            updated_at:          Number(r.updated_at || 0),
+            /* An override whose implied fee has drifted from fee_bps is the
+             * failure this table exists to expose. */
+            fee_drift_bps: Number(r.effective_fee_bps || 0) - Number(r.fee_bps || 0),
+            accrues: (r.pool_mode || 'solo') === 'pps-classic',
+        };
+    } catch {
+        return null;   /* pre-pool_meta DB */
+    }
+}
+
+/* Independently re-derive the PPS ledger instead of reporting it.
+ *
+ * Every other figure on the audit page is a number the proxy wrote and this
+ * page repeats. These three are checks:
+ *
+ *   1. arithmetic — every credited share must satisfy
+ *      credited_sats == floor(difficulty * rate_used), where both operands
+ *      live on the share's own row. Holds no matter how far the rate has
+ *      since moved, because nothing current is consulted. Exact equality is
+ *      the right test: the proxy compiles without -ffast-math, so the same
+ *      IEEE-754 multiply and truncation reproduce bit-for-bit here.
+ *
+ *   2. provenance — every rate in the log must follow from the template
+ *      inputs recorded beside it and the configured fee. Catches a rate that
+ *      was applied consistently but derived wrongly, which check 1 cannot
+ *      see.
+ *
+ *   3. linkage — every rate a share was credited at must appear in the log,
+ *      so no share was paid at a rate the pool never published. Scoped to
+ *      shares newer than the first logged rate; older ones predate the log
+ *      and are counted as unverifiable, not as failures.
+ *
+ * Returns null on a DB predating these columns, in which case the caller
+ * should say the ledger cannot be verified rather than imply it passed.
+ * Pass a workerId to scope checks 1 and 3 to one miner. */
+export function rateVerification(handle, workerId = null) {
+    const d = !handle ? null
+            : (typeof handle.get === 'function' ? handle.get() : handle);
+    if (!d) return null;
+    const scoped = workerId !== null && workerId !== undefined;
+    /* Two spellings because the orphan query aliases the table. */
+    const where   = scoped ? 'AND worker_id = ?'   : '';
+    const whereS  = scoped ? 'AND s.worker_id = ?' : '';
+    const run     = (sql) => scoped ? d.prepare(sql).get(workerId)
+                                    : d.prepare(sql).get();
+    try {
+        const shares = run(`
+            SELECT COUNT(*)                                              AS total,
+                   COUNT(*) FILTER (WHERE credited_sats > 0)             AS credited,
+                   COUNT(*) FILTER (WHERE rate_used > 0)                 AS verifiable,
+                   COUNT(*) FILTER (WHERE rate_used > 0
+                       AND credited_sats <> CAST(difficulty * rate_used AS INTEGER))
+                                                                         AS mismatched,
+                   COUNT(*) FILTER (WHERE rate_used = 0 AND credited_sats > 0)
+                                                                         AS unverifiable
+              FROM shares
+             WHERE 1 = 1 ${where}
+        `);
+        const rates = d.prepare(`
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE ABS(rate_sats_per_diff
+                       - (block_value_sats * 1.0 / network_difficulty)
+                         * (1 - fee_bps / 10000.0)) > 1e-9)  AS inconsistent,
+                   MIN(ts) AS first_ts
+              FROM rate_history
+        `).get();
+        /* NULL-safe by construction: with an empty log MIN(ts) is NULL, the
+         * ts comparison yields NULL, and nothing is counted — so a pool that
+         * has not published a rate yet reports 0 orphans, not "everything is
+         * an orphan". */
+        const orphans = run(`
+            SELECT COUNT(*) AS n
+              FROM shares s
+             WHERE s.rate_used > 0
+               AND s.ts >= (SELECT MIN(ts) FROM rate_history)
+               AND NOT EXISTS (SELECT 1 FROM rate_history r
+                                WHERE r.rate_sats_per_diff = s.rate_used)
+               ${whereS}
+        `);
+        const mismatched   = Number(shares.mismatched   || 0);
+        const inconsistent = Number(rates.inconsistent  || 0);
+        const orphaned     = Number(orphans.n           || 0);
+        const credited     = Number(shares.credited     || 0);
+        const verifiable   = Number(shares.verifiable   || 0);
+        return {
+            ok: mismatched === 0 && inconsistent === 0 && orphaned === 0,
+            share_count:  Number(shares.total || 0),
+            credited, verifiable,
+            unverifiable: Number(shares.unverifiable || 0),
+            mismatched, orphaned,
+            /* What share of the credited ledger these checks actually cover.
+             * 100% on a DB written entirely by this build or later. */
+            coverage_pct: credited > 0 ? (verifiable / credited) * 100 : 100,
+            rate_rows:         Number(rates.total || 0),
+            rates_inconsistent: inconsistent,
+            rate_log_from:     Number(rates.first_ts || 0),
+        };
+    } catch {
+        return null;   /* DB predates rate_used / rate_history */
+    }
+}
+
+/* What the pool is mining right now, and what it mined before.
+ *
+ * The row is appended by the proxy on each material template change, so the
+ * newest row is the current job and the rest is history. `source` is the
+ * field worth reading: 'bitcoind' means the pool built its own coinbase and
+ * the block carries no BIP300/301 commitments, so no sidechain can be
+ * merge-mined into it — a condition invisible from every other page.
+ *
+ * Returns null on a DB predating the table. */
+export function templates(handle, { limit = 50 } = {}) {
+    const d = !handle ? null
+            : (typeof handle.get === 'function' ? handle.get() : handle);
+    if (!d) return null;
+    try {
+        /* last_seen/polls arrived when repeat polls started folding into the
+         * row they match. A DB written by an older proxy that has not been
+         * restarted yet has neither, and every row there is a single
+         * observation — so ts/1 are the honest values, not placeholders. */
+        const cols  = new Set(d.prepare('PRAGMA table_info(templates)').all().map(c => c.name));
+        if (cols.size === 0) return null;
+        const spans = cols.has('last_seen') && cols.has('polls');
+        const rows = d.prepare(`
+            SELECT id, ts, height, prev_hash, bits, network_difficulty,
+                   coinbase_value_sats, tx_count, tx_fees_sats, source,
+                   cb_spendable, cb_op_returns, longpoll, rate_sats_per_diff,
+                   ${spans ? 'COALESCE(NULLIF(last_seen, 0), ts)' : 'ts'} AS last_seen,
+                   ${spans ? 'MAX(COALESCE(polls, 1), 1)'         : '1'}  AS polls
+              FROM templates
+             ORDER BY id DESC
+             LIMIT ?
+        `).all(Math.max(1, Math.min(500, Number(limit) || 50)));
+        if (rows.length === 0) {
+            return { current: null, history: [], total: 0, commitments_ok: null };
+        }
+        const norm = r => ({
+            id:        Number(r.id),
+            ts:        Number(r.ts),
+            height:    Number(r.height),
+            prev_hash: r.prev_hash,
+            bits:      r.bits,
+            network_difficulty:  Number(r.network_difficulty),
+            coinbase_value_sats: Number(r.coinbase_value_sats),
+            tx_count:      Number(r.tx_count),
+            tx_fees_sats:  Number(r.tx_fees_sats),
+            source:        r.source,
+            cb_spendable:  Number(r.cb_spendable),
+            cb_op_returns: Number(r.cb_op_returns),
+            longpoll:      !!r.longpoll,
+            rate_sats_per_diff: Number(r.rate_sats_per_diff),
+            /* A row is a span, not an instant: ts is when this template was
+             * first served, last_seen the most recent poll that still matched
+             * it, and polls how many polls that covers. */
+            last_seen:  Number(r.last_seen),
+            polls:      Number(r.polls),
+            held_sec:   Math.max(0, Number(r.last_seen) - Number(r.ts)),
+            /* The subsidy is whatever is left once fees are removed. Derived
+             * rather than stored: it is a property of the chain's schedule,
+             * not of the template. */
+            subsidy_sats: Number(r.coinbase_value_sats) - Number(r.tx_fees_sats),
+            /* A server-dictated coinbase carries the sidechain commitments
+             * alongside the witness commitment, so more than one OP_RETURN
+             * is the observable signature of a mergeable block. */
+            has_commitments: r.source === 'enforcer' && Number(r.cb_op_returns) > 1,
+        });
+        const total = d.prepare('SELECT COUNT(*) AS n FROM templates').get().n;
+        const all   = rows.map(norm);
+        return {
+            current: all[0],
+            history: all.slice(1),
+            total:   Number(total),
+            /* Whether the pool is currently producing blocks a sidechain can
+             * be merge-mined into. */
+            commitments_ok: all[0].has_commitments,
+        };
+    } catch {
+        return null;   /* DB predates the templates table */
+    }
+}
+
 export function nodeStatus(handle) {
     const d = db(handle);
     if (!d) return null;

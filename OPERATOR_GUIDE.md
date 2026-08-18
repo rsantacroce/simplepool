@@ -1,8 +1,8 @@
-# Pool operator guide (pps-thunder-classic)
+# Pool operator guide (pps-classic)
 
 Everything you need to run this pool day-to-day. Assumes the branch
-already deployed (see `PPS_THUNDER.md` and `CLASSIC_PAYOUTS.md` for
-background on why the design looks like this).
+already deployed (see `CLASSIC_PAYOUTS.md` for background on why the
+design looks like this).
 
 ---
 
@@ -19,8 +19,11 @@ tracked by git.
 | Public dashboard | `http://<pool-host>:8081/` | none |
 | **Admin dashboard** | `http://<pool-host>:8081/admin` | **`admin` / `<see /root/simplepool-admin-cred.txt on the box>`** |
 | Admin JSON API | `http://<pool-host>:8081/api/admin/summary` | same basic auth |
+| Everything as JSON | `http://<pool-host>:8081/api/status` | none |
+| Which commit is running | `http://<pool-host>:8081/api/versions` | none |
 | Stratum (miner endpoint) | `stratum+tcp://<pool-host>:3334` | username = Thunder base58 address |
 | SSH | `root@<pool-host>` | `<ssh-key>` |
+| Everything from the shell | `simplepoolctl status` / `doctor` / `logs -f` | root for `restart`, `upgrade`, `uninstall` |
 
 The admin password is stashed at `/root/simplepool-admin-cred.txt` on the
 box (root-only). To rotate, edit
@@ -34,7 +37,7 @@ password](#rotating-the-admin-password) below.
 ## Where things live on the box
 
 - **Root**: `/home/forknet/pps-thunder-test/`
-  - `simplepool/` — this repo, checked out at `pps-thunder-classic`
+  - `simplepool/` — this repo, checked out at `main`
   - `data/shares.db` — pool state (SQLite, WAL mode)
   - `data/archive/` — old DB snapshots from mode switches
   - `logs/` — pool + payout + Thunder logs (plus stashed Thunder mnemonic)
@@ -49,6 +52,45 @@ password](#rotating-the-admin-password) below.
 
 - **Config**: `/home/forknet/pps-thunder-test/simplepool/proxy.conf`
   (gitignored). Current `pool_mode = pps-classic`.
+
+---
+
+## Which commit is running
+
+`GET /api/versions` (no auth) answers this for all four moving parts —
+simplepool, the enforcer, thunder, bitcoind — without SSHing in. Each entry
+carries a `provenance` field saying how strong the answer is:
+
+- `binary` — the process prints its own build commit (`--version`). This is
+  the only one that is proof; simplepool and the enforcer do it.
+- `manifest` — a `<binary>.build.json` recorded at build time and pinned to
+  the binary by sha256. This is how thunder and bitcoind get a trustworthy
+  commit.
+- `checkout` — read from the git tree beside the binary. Describes what
+  *would* be built now, not what is running. Treat as a hint.
+
+**After rebuilding thunder, bitcoind, or the enforcer by hand, record it:**
+
+```bash
+~/forknet-software/simplepool/scripts/record-build.sh thunder \
+    ~/forknet-software/thunder-rust \
+    ~/forknet-software/thunder-rust/target/release/thunder_app
+```
+
+Skip that and the endpoint falls back to the checkout — which goes stale the
+moment someone runs `git pull` in that directory without rebuilding, and then
+confidently reports a commit that was never compiled.
+
+Things worth watching in the response:
+
+| field | meaning |
+| --- | --- |
+| `needs_review` | ids of components with anything below going on |
+| `commit_matches: false` | binary and source tree disagree — usually a pull with no rebuild |
+| `running.binary_replaced` | rebuilt but never restarted; the process is running deleted code |
+| `running.process_found: false` | nothing is running that binary — service down, or running a copy from elsewhere |
+| `manifest.verified: false` | rebuilt without re-recording; the manifest describes a previous artifact |
+| `checkout.dirty` | tracked files modified — the named commit is not the whole truth |
 
 ---
 
@@ -117,6 +159,22 @@ Also check the **In-flight payouts** card — should be empty. Any row
 with a set `txid` means a payout crashed mid-flight and needs manual
 reconciliation.
 
+From the shell, `simplepoolctl status` covers the same ground (services,
+ports, worker count, blocks found, sats owed) and `simplepoolctl doctor`
+checks the things that actually break: the binary runs here, bitcoind
+answers, the DB is writable, something is listening on :3334.
+
+**On the payout cadence.** Payouts run as a **daily batch** — once every 24h
+everyone over `PAYOUT_MIN_SATS` goes out in a single Thunder transaction.
+So "nobody has been paid yet today" is the normal state for most of the day,
+not a fault. What does *not* wait a day is settlement: once a batch is
+broadcast the worker re-checks it every 30s until Thunder mines it, because
+nobody in that batch is credited until then. To pay out early, use **Trigger
+payout now** on the admin dashboard. To change the cadence, re-run the
+installer with `--payout-interval-hours N`, or edit
+`PAYOUT_INTERVAL_MS` in
+`/etc/systemd/system/simplepool-payout.service.d/local.conf`.
+
 ### 2. Deposit BTC into Thunder (when reserve is short)
 
 **Currently manual — no admin button yet.** The runbook:
@@ -144,9 +202,9 @@ curl -sS -H 'content-type: application/json' \
   $ENFORCER/cusf.mainchain.v1.WalletService/CreateDepositTransaction
 
 # 3. Wait for a natural mainchain block from your miner. (On regtest you
-#    can force one — GenerateBlocks is a streaming RPC, so use the helper:
-#    scripts/enforcer-rpc.sh --stream \
-#      cusf.mainchain.v1.WalletService/GenerateBlocks '{"blocks":1}' )
+#    can force one:
+#    scripts/enforcer-rpc.sh cusf.mainchain.v1.MiningService/GenerateToAddress \
+#      '{"blocks":1, "address":"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"}' )
 
 # 4. Confirm the Ctip moved
 curl -sS -H 'content-type: application/json' -d '{"sidechain_number":9}' \

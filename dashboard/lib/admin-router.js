@@ -11,6 +11,7 @@ import express from 'express';
 import * as admin   from './admin.js';
 import * as actions from './actions.js';
 import { issueToken, consumeToken } from './csrf.js';
+import { depositStatuses, summarise } from './deposit-status.js';
 
 export function createAdminRouter({
     db,                     // read-only handle
@@ -20,7 +21,6 @@ export function createAdminRouter({
     ENFORCER_GRPC_ADDR,
     THUNDER_SIDECHAIN_ID,
     RESERVE_ADDRESS,
-    PPS_SATS_PER_DIFF,
 } = {}) {
     const router = express.Router();
     const parseAdminForm = express.urlencoded({ extended: false, limit: '4kb' });
@@ -38,12 +38,15 @@ export function createAdminRouter({
                 Promise.resolve(admin.recentDeposits(db, 25)),
                 Promise.resolve(admin.recentBlocksFound(db, 15)),
             ]);
+        /* Broadcast attempts, both kinds, successes and failures. Cheap
+         * enough to include on every admin render. */
+        const txAttempts = admin.recentTxAttempts(db, { limit: 40 });
         return {
             reserve, enforcer,
             reserveAddress:        RESERVE_ADDRESS,
             reserveSidechainId:    THUNDER_SIDECHAIN_ID,
             payoutAdminConfigured: !!PAYOUT_ADMIN_URL,
-            totals, workers, inFlight, payouts, deposits, blocks,
+            totals, workers, inFlight, payouts, deposits, blocks, txAttempts,
         };
     }
 
@@ -77,11 +80,33 @@ export function createAdminRouter({
         return '/admin';
     }
 
+    /* Resolve where each recorded deposit actually is. Only the deposits
+     * page shows this, and it costs three enforcer round trips, so it is not
+     * folded into adminSummary(). */
+    function depositStatusFor(deposits) {
+        return depositStatuses(deposits, {
+            enforcerGrpcAddr: ENFORCER_GRPC_ADDR,
+            thunderRpcUrl:    THUNDER_RPC_URL,
+            sidechainId:      THUNDER_SIDECHAIN_ID,
+        });
+    }
+
     /* --- page helpers --- */
     async function renderAdminPage(view, req, res) {
         const summary = await adminSummary();
+        const extra = {};
+        if (view === 'admin-deposits') {
+            /* Never let a status probe take the page down: the deposit form
+             * and the ledger must render even when the enforcer is out. */
+            extra.depositStatus = await depositStatusFor(summary.deposits)
+                .catch(e => ({ rows: summary.deposits.map(d => ({ ...d, status: null })),
+                               tipHeight: 0, ctipTxid: null,
+                               reserve: { ok: false, error: e.message },
+                               errors: [e.message] }));
+        }
         res.render(view, {
             ...summary,
+            ...extra,
             csrfToken: issueToken(),
             flash:     readFlash(req),
         });
@@ -106,7 +131,7 @@ export function createAdminRouter({
 
     /* --- Per-worker audit (unchanged surface, uses admin.workerAudit) --- */
     function workerAuditFor(workerId) {
-        const audit = admin.workerAudit(db, workerId, { rate: PPS_SATS_PER_DIFF });
+        const audit = admin.workerAudit(db, workerId);
         if (!audit) return null;
         audit.payouts = admin.payoutsForWorker(db, workerId, 100);
         return audit;
@@ -153,6 +178,25 @@ export function createAdminRouter({
     router.post('/action/trigger-payout', parseAdminForm, requireCsrf, async (req, res) => {
         const r = await actions.triggerPayout({ payoutAdminUrl: PAYOUT_ADMIN_URL });
         flashRedirect(res, r, returnTarget(req));
+    });
+
+    /* Explicit "has it gone through yet?" probe. The page already resolves
+     * status on every render, so this exists to answer in words — and to
+     * name the confirmed-but-not-credited case, which is the one an operator
+     * is most likely to misread as finished. */
+    router.post('/action/check-deposits', parseAdminForm, requireCsrf, async (req, res) => {
+        try {
+            const st = await depositStatusFor(admin.recentDeposits(db, 25));
+            flashRedirect(res, {
+                ok: st.errors.length === 0,
+                msg: st.errors.length ? 'deposit status checked, with errors'
+                                      : 'deposit status checked',
+                detail: summarise(st) + (st.errors.length ? ` [${st.errors.join('; ')}]` : ''),
+            }, returnTarget(req));
+        } catch (e) {
+            flashRedirect(res, { ok: false, msg: 'deposit status check failed',
+                                 detail: e.message }, returnTarget(req));
+        }
     });
 
     router.post('/action/deposit', parseAdminForm, requireCsrf, async (req, res) => {

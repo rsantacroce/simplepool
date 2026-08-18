@@ -22,11 +22,23 @@
 #include <sys/time.h>
 #include <time.h>
 
-/* Keep in sync with schema.sql */
-static const char *SCHEMA_SQL =
+/* Keep in sync with schema.sql.
+ *
+ * Split into parts only because one concatenated literal now exceeds the
+ * 4095 characters ISO C99 requires a compiler to support, which -Wpedantic
+ * flags as an error here. The parts are applied in order and the split point
+ * carries no meaning — when adding tables, start a new part rather than
+ * growing one past the limit. */
+static const char *SCHEMA_SQL_PARTS[] = {
     "PRAGMA journal_mode = WAL;\n"
     "PRAGMA synchronous = NORMAL;\n"
     "PRAGMA foreign_keys = ON;\n"
+    /* Without this SQLite returns SQLITE_BUSY the instant another connection
+     * holds the write lock — no waiting at all. The writer thread has already
+     * dequeued its batch by then, so a single concurrent writer (a manual
+     * sqlite3 session, a backup, a maintenance script) silently destroyed
+     * shares the miner had been told were accepted. Wait instead. */
+    "PRAGMA busy_timeout = 5000;\n"
     "CREATE TABLE IF NOT EXISTS workers ("
     "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  name            TEXT UNIQUE NOT NULL,"
@@ -34,13 +46,27 @@ static const char *SCHEMA_SQL =
     "  last_seen       INTEGER NOT NULL,"
     "  payout_address  TEXT"
     ");"
+    /* credited_sats is what this share was ACTUALLY credited at the time it
+     * was accepted — not something to be recomputed later from a rate read
+     * from config. The rate is derived per-template and moves with network
+     * difficulty, so recomputing historical shares against a current rate
+     * silently misreports them. Audits must sum this column. 0 in solo mode,
+     * where no PPS accrual happens.
+     *
+     * rate_used is the exact rate that produced credited_sats. Recording the
+     * multiplicand next to the product is what turns the credit from
+     * self-attested into checkable: CAST(difficulty * rate_used AS INTEGER)
+     * must equal credited_sats for every row, and that holds no matter how
+     * far the rate has since moved. */
     "CREATE TABLE IF NOT EXISTS shares ("
-    "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
-    "  worker_id   INTEGER NOT NULL REFERENCES workers(id),"
-    "  ts          INTEGER NOT NULL,"
-    "  difficulty  REAL NOT NULL,"
-    "  is_block    INTEGER NOT NULL DEFAULT 0,"
-    "  block_hash  TEXT"
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  worker_id     INTEGER NOT NULL REFERENCES workers(id),"
+    "  ts            INTEGER NOT NULL,"
+    "  difficulty    REAL NOT NULL,"
+    "  is_block      INTEGER NOT NULL DEFAULT 0,"
+    "  block_hash    TEXT,"
+    "  credited_sats INTEGER NOT NULL DEFAULT 0,"
+    "  rate_used     REAL NOT NULL DEFAULT 0"
     ");"
     "CREATE INDEX IF NOT EXISTS shares_ts_idx ON shares(ts);"
     "CREATE INDEX IF NOT EXISTS shares_worker_ts_idx ON shares(worker_id, ts);"
@@ -72,6 +98,82 @@ static const char *SCHEMA_SQL =
     "  tip_observed_at INTEGER,"
     "  updated_at      INTEGER"
     ");"
+    /* Single source of truth for what the running proxy is actually paying.
+     *
+     * The dashboard MUST read the rate from here rather than from its own
+     * config or environment. Holding the same number in two places is how
+     * the audit ends up disagreeing with the ledger it is meant to check.
+     *
+     * rate_source is 'derived' (rate computed from the live template and
+     * fee_bps — the default) or 'override' (operator pinned
+     * pps_sats_per_diff, which is taken NET of fee and bypasses fee_bps).
+     * effective_fee_bps is what the numbers actually imply, which under an
+     * override can differ from the configured fee_bps. */
+    "CREATE TABLE IF NOT EXISTS pool_meta ("
+    "  id                  INTEGER PRIMARY KEY CHECK (id = 1),"
+    "  pool_mode           TEXT,"
+    "  fee_bps             INTEGER,"
+    "  rate_source         TEXT,"
+    "  rate_sats_per_diff  REAL,"     /* effective, net of fee */
+    "  gross_sats_per_diff REAL,"     /* fair value before fee */
+    "  effective_fee_bps   REAL,"
+    "  network_difficulty  REAL,"
+    "  block_value_sats    INTEGER,"
+    "  credited_from       INTEGER,"  /* first ts with credited_sats populated */
+    "  updated_at          INTEGER,"
+    /* Mirror of the writer thread's events_lost counter. Lives here because
+     * it is otherwise process-local: accepted work that never reached the DB
+     * is invisible to every query, so the dashboard could not surface it.
+     * Written on the template path, which is a different connection state
+     * from the batch commit that failed. */
+    "  events_lost         INTEGER NOT NULL DEFAULT 0"
+    ");"
+    /* Append-only log of every distinct rate the proxy has paid at. pool_meta
+     * is overwritten on every template, so without this the rate a share was
+     * credited at is unrecoverable after the fact. Appended only when the
+     * tuple changes. Prunable: shares.rate_used carries per-share
+     * verification on its own; this table exists to show the rate itself was
+     * derived fairly from the template. */
+    "CREATE TABLE IF NOT EXISTS rate_history ("
+    "  id                  INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  ts                  INTEGER NOT NULL,"
+    "  rate_sats_per_diff  REAL    NOT NULL,"
+    "  gross_sats_per_diff REAL    NOT NULL,"
+    "  fee_bps             INTEGER NOT NULL,"
+    "  network_difficulty  REAL    NOT NULL,"
+    "  block_value_sats    INTEGER NOT NULL,"
+    "  rate_source         TEXT    NOT NULL"
+    ");"
+    "CREATE INDEX IF NOT EXISTS rate_history_ts_idx   ON rate_history(ts);"
+    "CREATE INDEX IF NOT EXISTS rate_history_rate_idx ON rate_history(rate_sats_per_diff);"
+    /* What the pool is mining now, and what it mined before. One row per
+     * materially distinct template — see store_record_template(). `source`
+     * distinguishes a backend-dictated coinbase (BIP22 "coinbasetxn", carries
+     * the BIP300/301 commitments) from one we built ourselves (carries none,
+     * so no sidechain can be merge-mined into the block) — see the schema.sql
+     * comment. */
+    "CREATE TABLE IF NOT EXISTS templates ("
+    "  id                  INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  ts                  INTEGER NOT NULL,"
+    "  height              INTEGER NOT NULL,"
+    "  prev_hash           TEXT    NOT NULL,"
+    "  bits                TEXT    NOT NULL,"
+    "  network_difficulty  REAL    NOT NULL,"
+    "  coinbase_value_sats INTEGER NOT NULL,"
+    "  tx_count            INTEGER NOT NULL,"
+    "  tx_fees_sats        INTEGER NOT NULL,"
+    "  source              TEXT    NOT NULL,"
+    "  cb_spendable        INTEGER NOT NULL,"
+    "  cb_op_returns       INTEGER NOT NULL,"
+    "  longpoll            INTEGER NOT NULL,"
+    "  rate_sats_per_diff  REAL    NOT NULL,"
+    "  last_seen           INTEGER NOT NULL DEFAULT 0,"
+    "  polls               INTEGER NOT NULL DEFAULT 1"
+    ");"
+    "CREATE INDEX IF NOT EXISTS templates_ts_idx     ON templates(ts);"
+    "CREATE INDEX IF NOT EXISTS templates_height_idx ON templates(height);",
+
+    /* ---- part 2 ---- */
     /* PPS accrual ledger. One row per worker; the C proxy only INCREMENTS
      * accrued_sats. paid_sats is updated by a downstream payout service
      * that issues Thunder transactions to drain accrued - paid. */
@@ -92,6 +194,36 @@ static const char *SCHEMA_SQL =
     "  started_at    INTEGER NOT NULL"
     ");"
     "CREATE INDEX IF NOT EXISTS payouts_in_flight_worker_idx ON payouts_in_flight(worker_id);"
+    /* Every attempt to broadcast a transaction, successful or not. Owned by
+     * the dashboard and the payout worker; the C proxy never writes here.
+     *
+     * `deposits` and `payouts` record what actually happened. A failed
+     * broadcast is not a deposit or a payout, but it is the thing an
+     * operator most needs to see — so it lands here instead, with the raw
+     * transaction whenever it can be recovered. Without this a failure left
+     * nothing behind but a truncated flash message.
+     *
+     * raw_tx is the full hex when obtainable. For a deposit that failed at
+     * broadcast the enforcer has still signed and stored the tx, so it can
+     * be recovered afterwards via ListSidechainDepositTransactions; `stage`
+     * records how far the attempt got. */
+    "CREATE TABLE IF NOT EXISTS tx_attempts ("
+    "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  ts          INTEGER NOT NULL,"          /* unix seconds */
+    "  kind        TEXT    NOT NULL,"          /* 'deposit' | 'payout' */
+    "  status      TEXT    NOT NULL,"          /* 'broadcast' | 'failed' */
+    "  stage       TEXT,"                      /* step reached when it failed */
+    "  txid        TEXT,"
+    "  raw_tx      TEXT,"                      /* full hex, when recoverable */
+    "  amount_sats INTEGER,"
+    "  fee_sats    INTEGER,"
+    "  destination TEXT,"
+    "  worker_id   INTEGER,"                   /* payouts only */
+    "  error       TEXT,"                      /* full, never truncated */
+    "  detail      TEXT"                       /* JSON: request params */
+    ");"
+    "CREATE INDEX IF NOT EXISTS tx_attempts_ts_idx ON tx_attempts(ts);"
+    "CREATE INDEX IF NOT EXISTS tx_attempts_kind_idx ON tx_attempts(kind, ts);"
     /* pps-classic deposit ledger. Owned by the admin dashboard; the C
      * proxy never writes here. Created here so a fresh DB is complete. */
     "CREATE TABLE IF NOT EXISTS deposits ("
@@ -117,7 +249,8 @@ static const char *SCHEMA_SQL =
     "  note         TEXT"
     ");"
     "CREATE INDEX IF NOT EXISTS payouts_worker_ts_idx ON payouts(worker_id, paid_at);"
-    "CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);";
+    "CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);",
+};
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
  * earlier schemas. Duplicate-column errors are silently ignored. */
@@ -126,7 +259,37 @@ static const char *MIGRATIONS_SQL[] = {
     "ALTER TABLE blocks_found ADD COLUMN finder_address TEXT",
     "ALTER TABLE blocks_found ADD COLUMN reward_sats    INTEGER",
     "ALTER TABLE blocks_found ADD COLUMN fee_sats       INTEGER",
+    /* Rows written before this column existed keep 0. They are not
+     * retroactively creditable — the rate in force when they were accepted
+     * is not recoverable — so an audit spanning the upgrade must fall back
+     * to pps_credits for the earlier period. pool_meta.credited_from marks
+     * the boundary. */
+    "ALTER TABLE shares       ADD COLUMN credited_sats  INTEGER NOT NULL DEFAULT 0",
+    /* Rows predating this column keep 0, which the audit reports as
+     * "unverifiable" rather than "wrong": their credited_sats is still the
+     * authoritative amount, there is simply no stored multiplicand to check
+     * it against. rate_history (created by SCHEMA_SQL above) likewise only
+     * covers rates published after the upgrade. */
+    "ALTER TABLE shares       ADD COLUMN rate_used      REAL NOT NULL DEFAULT 0",
+    /* Template rows used to be append-only per material change, where
+     * "material" included the block value — which moves on nearly every
+     * mempool tick. These two turn each row into a span: `ts` stays first-seen
+     * and `last_seen`/`polls` record how many polls collapsed into it. Rows
+     * predating the columns are each a single observation, so backfilling
+     * last_seen from ts is exact, not a guess. */
+    "ALTER TABLE templates    ADD COLUMN last_seen      INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE templates    ADD COLUMN polls          INTEGER NOT NULL DEFAULT 1",
+    "UPDATE templates SET last_seen = ts WHERE last_seen = 0",
+    /* See the pool_meta comment above: without this the counter added in
+     * PR #32 is only ever readable at shutdown. */
+    "ALTER TABLE pool_meta    ADD COLUMN events_lost    INTEGER NOT NULL DEFAULT 0",
 };
+
+/* Retries for one batch. busy_timeout (5s) bounds each attempt, so the worst
+ * case is a long stall rather than a fast loop — which is the right trade:
+ * enqueue-side overflow is counted in shares_dropped and visible, whereas a
+ * dropped batch here is credited work vanishing. */
+#define STORE_COMMIT_ATTEMPTS 3
 
 #define EV_SHARE   1
 #define EV_REJECT  2
@@ -149,6 +312,7 @@ typedef struct {
     int64_t  reward_sats;       /* EV_BLOCK only */
     int64_t  fee_sats;          /* EV_BLOCK only */
     int64_t  delta_sats;        /* EV_CREDIT only */
+    double   rate_used;         /* EV_SHARE only: multiplicand for delta_sats */
     char     worker_name[WORKER_NAME_MAX];
     char     payout_address[ADDR_MAX];   /* EV_SHARE, EV_BLOCK, EV_CREDIT: may be empty */
     char     hash[HASH_STR_MAX];
@@ -190,6 +354,7 @@ struct store {
 
     int commit_window_ms;
     int commit_max_shares;
+    int templates_retention_days;   /* 0 = keep every row */
 
     worker_slot_t cache[WORKER_CACHE_SLOTS];
 
@@ -202,6 +367,7 @@ struct store {
     _Atomic uint64_t credits_committed;
     _Atomic uint64_t batches;
     _Atomic uint64_t pg_errors;
+    _Atomic uint64_t events_lost;
 
     /* Sequence: monotonically increasing counter of enqueued events.
      * 'committed_seq' tracks the highest sequence that has been
@@ -217,6 +383,12 @@ static size_t g_test_ring_cap = 0;
 void store_test_set_ring_capacity(size_t cap) { g_test_ring_cap = cap; }
 
 /* ---- helpers ---------------------------------------------------------- */
+
+/* Linear backoff between commit attempts: 25ms, 50ms, ... */
+static void backoff_sleep(int attempt) {
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 25L * 1000000L * attempt };
+    nanosleep(&ts, NULL);
+}
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -316,6 +488,12 @@ static void process_event(store_t *s, const event_t *ev) {
             sqlite3_bind_text(s->st_insert_share, 5, ev->hash, -1, SQLITE_TRANSIENT);
         else
             sqlite3_bind_null(s->st_insert_share, 5);
+        /* What this share was credited, at the rate in force when it was
+         * accepted, and the rate itself. 0 in solo mode. Both come from the
+         * same computation in the caller, so the pair is always internally
+         * consistent — see the shares schema comment. */
+        sqlite3_bind_int64 (s->st_insert_share, 6, ev->delta_sats);
+        sqlite3_bind_double(s->st_insert_share, 7, ev->rate_used);
         if (sqlite3_step(s->st_insert_share) != SQLITE_DONE) {
             atomic_fetch_add(&s->pg_errors, 1);
         } else {
@@ -391,6 +569,44 @@ static void process_event(store_t *s, const event_t *ev) {
     }
 }
 
+/* Attempts to land one batch. The events are already out of the ring, so a
+ * failure here destroys accepted work — retry rather than count and move on.
+ *
+ * busy_timeout already makes SQLITE_BUSY rare; these attempts cover a lock
+ * held longer than that, and an I/O error that clears. Counters advance only
+ * on the attempt that actually commits, so a retried batch is counted once.
+ * Returns 0 committed, -1 out of attempts. */
+static int commit_batch(store_t *s, event_t *batch, size_t take) {
+    for (int attempt = 1; attempt <= STORE_COMMIT_ATTEMPTS; ++attempt) {
+        char *err = NULL;
+        if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
+            LOG_WARN("store: BEGIN failed (attempt %d/%d): %s",
+                     attempt, STORE_COMMIT_ATTEMPTS, err ? err : "?");
+            sqlite3_free(err);
+            atomic_fetch_add(&s->pg_errors, 1);
+            backoff_sleep(attempt);
+            continue;
+        }
+
+        for (size_t i = 0; i < take; ++i) process_event(s, &batch[i]);
+
+        if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK) {
+            atomic_fetch_add(&s->batches, 1);
+            return 0;
+        }
+        LOG_WARN("store: COMMIT failed (attempt %d/%d): %s",
+                 attempt, STORE_COMMIT_ATTEMPTS, err ? err : "?");
+        sqlite3_free(err);
+        /* Nothing was durably written, so replaying the batch is safe. The
+         * per-event counters process_event() bumped are lost accuracy we
+         * accept: they describe attempts, the ledger describes reality. */
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        atomic_fetch_add(&s->pg_errors, 1);
+        backoff_sleep(attempt);
+    }
+    return -1;
+}
+
 static void *writer_main(void *arg) {
     store_t *s = (store_t *)arg;
 
@@ -435,21 +651,15 @@ static void *writer_main(void *arg) {
         pthread_mutex_unlock(&s->mu);
 
         /* BEGIN/COMMIT outside the producer mutex */
-        char *err = NULL;
-        if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
-            LOG_ERROR("store: BEGIN failed: %s", err ? err : "?");
-            sqlite3_free(err);
-            atomic_fetch_add(&s->pg_errors, 1);
-        } else {
-            for (size_t i = 0; i < take; ++i) process_event(s, &batch[i]);
-            if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) != SQLITE_OK) {
-                LOG_ERROR("store: COMMIT failed: %s", err ? err : "?");
-                sqlite3_free(err);
-                sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-                atomic_fetch_add(&s->pg_errors, 1);
-            } else {
-                atomic_fetch_add(&s->batches, 1);
-            }
+        if (commit_batch(s, batch, take) != 0) {
+            /* Out of retries. These events left the ring before the
+             * transaction opened and cannot be put back, so say so plainly —
+             * this is accepted work that will never be credited, not a
+             * transient blip. */
+            LOG_ERROR("store: LOST %zu event(s) after %d failed commit attempts"
+                      " — accepted shares in this batch are not credited",
+                      take, STORE_COMMIT_ATTEMPTS);
+            atomic_fetch_add(&s->events_lost, (uint64_t)take);
         }
 
         pthread_mutex_lock(&s->mu);
@@ -489,6 +699,8 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
 
     s->commit_window_ms = cfg->commit_window_ms > 0 ? cfg->commit_window_ms : 100;
     s->commit_max_shares = cfg->commit_max_shares > 0 ? cfg->commit_max_shares : 100;
+    s->templates_retention_days =
+        cfg->templates_retention_days > 0 ? cfg->templates_retention_days : 0;
     s->ring_cap = g_test_ring_cap > 0 ? g_test_ring_cap : 65536;
     s->ring = calloc(s->ring_cap, sizeof(event_t));
     if (!s->ring) { free(s); return -1; }
@@ -510,12 +722,17 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
     }
 
     char *err = NULL;
-    if (sqlite3_exec(s->db, SCHEMA_SQL, NULL, NULL, &err) != SQLITE_OK) {
-        LOG_ERROR("store: schema apply failed: %s", err ? err : "?");
+    for (size_t i = 0; i < sizeof(SCHEMA_SQL_PARTS) / sizeof(SCHEMA_SQL_PARTS[0]); ++i) {
+        err = NULL;
+        if (sqlite3_exec(s->db, SCHEMA_SQL_PARTS[i], NULL, NULL, &err) != SQLITE_OK) {
+            LOG_ERROR("store: schema apply (part %zu) failed: %s",
+                      i + 1, err ? err : "?");
+            sqlite3_free(err);
+            sqlite3_close(s->db);
+            free(s->ring); free(s);
+            return -3;
+        }
         sqlite3_free(err);
-        sqlite3_close(s->db);
-        free(s->ring); free(s);
-        return -3;
     }
     /* Best-effort migrations for DBs created by an older simplepool. Each
      * ALTER returns "duplicate column" on already-migrated DBs, which is
@@ -541,8 +758,9 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "  payout_address = COALESCE(workers.payout_address, excluded.payout_address) "
         "RETURNING id";
     static const char *Q_INS_SHARE =
-        "INSERT INTO shares (worker_id, ts, difficulty, is_block, block_hash) "
-        "VALUES (?, ?, ?, ?, ?)";
+        "INSERT INTO shares "
+        "  (worker_id, ts, difficulty, is_block, block_hash, credited_sats, rate_used) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)";
     static const char *Q_INS_REJECT =
         "INSERT INTO rejects (worker_name, ts, reason) VALUES (?, ?, ?)";
     static const char *Q_INS_BLOCK =
@@ -633,13 +851,14 @@ int store_record_share(store_t *s, const char *worker_name,
                        int is_block, const char *share_hash_or_null)
 {
     return store_record_share_addr(s, worker_name, NULL, ts_ms, difficulty,
-                                   is_block, share_hash_or_null);
+                                   is_block, share_hash_or_null, 0, 0.0);
 }
 
 int store_record_share_addr(store_t *s, const char *worker_name,
                             const char *payout_address,
                             uint64_t ts_ms, double difficulty,
-                            int is_block, const char *share_hash_or_null)
+                            int is_block, const char *share_hash_or_null,
+                            int64_t credited_sats, double rate_used)
 {
     if (!s || !worker_name) return -1;
     event_t ev;
@@ -648,6 +867,8 @@ int store_record_share_addr(store_t *s, const char *worker_name,
     ev.ts_ms = ts_ms;
     ev.difficulty = difficulty;
     ev.is_block = is_block;
+    ev.delta_sats = credited_sats;
+    ev.rate_used = rate_used;
     strncpy(ev.worker_name, worker_name, WORKER_NAME_MAX - 1);
     if (payout_address)
         strncpy(ev.payout_address, payout_address, ADDR_MAX - 1);
@@ -770,6 +991,261 @@ int store_record_node_tip(store_t *s, int height, const char *hash,
     return 0;
 }
 
+int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
+                           const char *rate_source,
+                           double rate_sats_per_diff,
+                           double gross_sats_per_diff,
+                           double effective_fee_bps,
+                           double network_difficulty,
+                           int64_t block_value_sats,
+                           uint64_t updated_ts_s)
+{
+    if (!s) return -1;
+    /* Prepared ad-hoc rather than cached: this runs once per template
+     * change, so the prepare cost is irrelevant and it keeps the hot
+     * writer-thread statement set untouched.
+     *
+     * credited_from is stamped on first write and never overwritten. It
+     * marks where shares.credited_sats becomes trustworthy, so an audit
+     * spanning the upgrade can tell which period it may sum directly. */
+    static const char *Q =
+        "INSERT INTO pool_meta (id, pool_mode, fee_bps, rate_source,"
+        "  rate_sats_per_diff, gross_sats_per_diff, effective_fee_bps,"
+        "  network_difficulty, block_value_sats, credited_from, updated_at,"
+        "  events_lost) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "  pool_mode = excluded.pool_mode,"
+        "  fee_bps = excluded.fee_bps,"
+        "  rate_source = excluded.rate_source,"
+        "  rate_sats_per_diff = excluded.rate_sats_per_diff,"
+        "  gross_sats_per_diff = excluded.gross_sats_per_diff,"
+        "  effective_fee_bps = excluded.effective_fee_bps,"
+        "  network_difficulty = excluded.network_difficulty,"
+        "  block_value_sats = excluded.block_value_sats,"
+        "  credited_from = COALESCE(pool_meta.credited_from, excluded.credited_from),"
+        "  updated_at = excluded.updated_at,"
+        "  events_lost = excluded.events_lost";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    pthread_mutex_lock(&s->node_tip_mu);
+    sqlite3_bind_text  (st, 1, pool_mode   ? pool_mode   : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int   (st, 2, fee_bps);
+    sqlite3_bind_text  (st, 3, rate_source ? rate_source : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st, 4, rate_sats_per_diff);
+    sqlite3_bind_double(st, 5, gross_sats_per_diff);
+    sqlite3_bind_double(st, 6, effective_fee_bps);
+    sqlite3_bind_double(st, 7, network_difficulty);
+    sqlite3_bind_int64 (st, 8, (sqlite3_int64)block_value_sats);
+    sqlite3_bind_int64 (st, 9, (sqlite3_int64)updated_ts_s);
+    sqlite3_bind_int64 (st, 10, (sqlite3_int64)updated_ts_s);
+    sqlite3_bind_int64 (st, 11, (sqlite3_int64)atomic_load(&s->events_lost));
+    int rc = sqlite3_step(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    return 0;
+}
+
+int store_record_rate(store_t *s, const char *rate_source,
+                      double rate_sats_per_diff,
+                      double gross_sats_per_diff,
+                      int fee_bps,
+                      double network_difficulty,
+                      int64_t block_value_sats,
+                      uint64_t ts_s)
+{
+    if (!s) return -1;
+
+    /* Append only when something actually moved. Compared bitwise against
+     * the newest row rather than with a tolerance: rate_used on the share
+     * rows is the same double, so an exact match is what makes the
+     * "every rate a share used appears in this log" check work. On a chain
+     * with a busy mempool the block value shifts every template and this
+     * appends about that often; on a quiet one it barely grows. */
+    static const char *Q_LAST =
+        "SELECT rate_sats_per_diff, gross_sats_per_diff, fee_bps,"
+        "       network_difficulty, block_value_sats, rate_source"
+        "  FROM rate_history ORDER BY id DESC LIMIT 1";
+    sqlite3_stmt *last = NULL;
+    int unchanged = 0;
+    pthread_mutex_lock(&s->node_tip_mu);
+    if (sqlite3_prepare_v2(s->db, Q_LAST, -1, &last, NULL) == SQLITE_OK &&
+        sqlite3_step(last) == SQLITE_ROW)
+    {
+        const unsigned char *src = sqlite3_column_text(last, 5);
+        unchanged =
+            sqlite3_column_double(last, 0) == rate_sats_per_diff  &&
+            sqlite3_column_double(last, 1) == gross_sats_per_diff &&
+            sqlite3_column_int   (last, 2) == fee_bps             &&
+            sqlite3_column_double(last, 3) == network_difficulty  &&
+            sqlite3_column_int64 (last, 4) == (sqlite3_int64)block_value_sats &&
+            src && rate_source && strcmp((const char *)src, rate_source) == 0;
+    }
+    sqlite3_finalize(last);
+    if (unchanged) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        return 0;
+    }
+
+    static const char *Q_INS =
+        "INSERT INTO rate_history (ts, rate_sats_per_diff, gross_sats_per_diff,"
+        "  fee_bps, network_difficulty, block_value_sats, rate_source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q_INS, -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_bind_int64 (st, 1, (sqlite3_int64)ts_s);
+    sqlite3_bind_double(st, 2, rate_sats_per_diff);
+    sqlite3_bind_double(st, 3, gross_sats_per_diff);
+    sqlite3_bind_int   (st, 4, fee_bps);
+    sqlite3_bind_double(st, 5, network_difficulty);
+    sqlite3_bind_int64 (st, 6, (sqlite3_int64)block_value_sats);
+    sqlite3_bind_text  (st, 7, rate_source ? rate_source : "", -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    return 0;
+}
+
+int store_record_template(store_t *s, const store_template_t *t) {
+    if (!s || !t) return -1;
+
+    /* Open a new row only when the *work* changes: the tip, the nBits, the
+     * template source or the shape of the server's coinbase.
+     *
+     * The block value and transaction count are deliberately NOT in the key.
+     * They drift with every mempool tick, so keying on them appended a row
+     * per poll at a height already recorded — ~2,880 rows/day here, almost
+     * all of it fee churn. A poll that matches the newest row now refreshes
+     * that row instead.
+     *
+     * source / cb_spendable / cb_op_returns stay in the key on purpose: a
+     * template that stops carrying the BIP300/301 commitments part-way
+     * through a height is precisely the regression the /templates page exists
+     * to surface, so it has to open its own row rather than overwrite the
+     * good one. */
+    static const char *Q_LAST =
+        "SELECT id, height, prev_hash, bits, source, cb_spendable, cb_op_returns,"
+        "       longpoll"
+        "  FROM templates ORDER BY id DESC LIMIT 1";
+    sqlite3_stmt *last = NULL;
+    int unchanged = 0;
+    sqlite3_int64 last_id = 0;
+    pthread_mutex_lock(&s->node_tip_mu);
+    if (sqlite3_prepare_v2(s->db, Q_LAST, -1, &last, NULL) == SQLITE_OK &&
+        sqlite3_step(last) == SQLITE_ROW)
+    {
+        const unsigned char *ph  = sqlite3_column_text(last, 2);
+        const unsigned char *bt  = sqlite3_column_text(last, 3);
+        const unsigned char *src = sqlite3_column_text(last, 4);
+        last_id = sqlite3_column_int64(last, 0);
+        unchanged =
+            sqlite3_column_int(last, 1) == t->height &&
+            ph  && strcmp((const char *)ph,  t->prev_hash ? t->prev_hash : "") == 0 &&
+            bt  && strcmp((const char *)bt,  t->bits      ? t->bits      : "") == 0 &&
+            src && strcmp((const char *)src, t->source    ? t->source    : "") == 0 &&
+            sqlite3_column_int(last, 5) == t->cb_spendable &&
+            sqlite3_column_int(last, 6) == t->cb_op_returns &&
+            sqlite3_column_int(last, 7) == (t->longpoll ? 1 : 0);
+    }
+    sqlite3_finalize(last);
+
+    /* Same work, fresher numbers: fold this poll into the row it belongs to.
+     * `ts` stays first-seen so the row remains a span of one template. */
+    if (unchanged) {
+        static const char *Q_UPD =
+            "UPDATE templates SET last_seen = ?, polls = polls + 1,"
+            "  network_difficulty = ?, coinbase_value_sats = ?, tx_count = ?,"
+            "  tx_fees_sats = ?, rate_sats_per_diff = ? WHERE id = ?";
+        sqlite3_stmt *up = NULL;
+        if (sqlite3_prepare_v2(s->db, Q_UPD, -1, &up, NULL) != SQLITE_OK) {
+            pthread_mutex_unlock(&s->node_tip_mu);
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -2;
+        }
+        sqlite3_bind_int64 (up, 1, (sqlite3_int64)t->ts_s);
+        sqlite3_bind_double(up, 2, t->network_difficulty);
+        sqlite3_bind_int64 (up, 3, (sqlite3_int64)t->coinbase_value_sats);
+        sqlite3_bind_int   (up, 4, t->tx_count);
+        sqlite3_bind_int64 (up, 5, (sqlite3_int64)t->tx_fees_sats);
+        sqlite3_bind_double(up, 6, t->rate_sats_per_diff);
+        sqlite3_bind_int64 (up, 7, last_id);
+        int urc = sqlite3_step(up);
+        pthread_mutex_unlock(&s->node_tip_mu);
+        sqlite3_finalize(up);
+        if (urc != SQLITE_DONE) {
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -2;
+        }
+        return 0;
+    }
+
+    static const char *Q_INS =
+        "INSERT INTO templates (ts, height, prev_hash, bits, network_difficulty,"
+        "  coinbase_value_sats, tx_count, tx_fees_sats, source, cb_spendable,"
+        "  cb_op_returns, longpoll, rate_sats_per_diff, last_seen, polls) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q_INS, -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_bind_int64 (st,  1, (sqlite3_int64)t->ts_s);
+    sqlite3_bind_int   (st,  2, t->height);
+    sqlite3_bind_text  (st,  3, t->prev_hash ? t->prev_hash : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text  (st,  4, t->bits      ? t->bits      : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(st,  5, t->network_difficulty);
+    sqlite3_bind_int64 (st,  6, (sqlite3_int64)t->coinbase_value_sats);
+    sqlite3_bind_int   (st,  7, t->tx_count);
+    sqlite3_bind_int64 (st,  8, (sqlite3_int64)t->tx_fees_sats);
+    sqlite3_bind_text  (st,  9, t->source    ? t->source    : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int   (st, 10, t->cb_spendable);
+    sqlite3_bind_int   (st, 11, t->cb_op_returns);
+    sqlite3_bind_int   (st, 12, t->longpoll ? 1 : 0);
+    sqlite3_bind_double(st, 13, t->rate_sats_per_diff);
+    sqlite3_bind_int64 (st, 14, (sqlite3_int64)t->ts_s);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+
+    /* Trim history on the way out. Driven off the template's own timestamp
+     * rather than wall-clock time so a replay or a test is deterministic.
+     * Nothing but the dashboard reads this table, so a dropped row costs
+     * visibility and nothing else — the ledger lives in shares/rate_history. */
+    int keep_days = s->templates_retention_days;
+    if (keep_days > 0) {
+        static const char *Q_TRIM = "DELETE FROM templates WHERE ts < ?";
+        sqlite3_stmt *tr = NULL;
+        if (sqlite3_prepare_v2(s->db, Q_TRIM, -1, &tr, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(tr, 1,
+                (sqlite3_int64)t->ts_s - (sqlite3_int64)keep_days * 86400);
+            sqlite3_step(tr);
+            sqlite3_finalize(tr);
+        }
+    }
+    pthread_mutex_unlock(&s->node_tip_mu);
+    return 0;
+}
+
 void store_get_stats(store_t *s, store_stats_t *out) {
     if (!s || !out) return;
     out->shares_queued    = atomic_load(&s->shares_queued);
@@ -780,4 +1256,5 @@ void store_get_stats(store_t *s, store_stats_t *out) {
     out->blocks_committed = atomic_load(&s->blocks_committed);
     out->batches          = atomic_load(&s->batches);
     out->pg_errors        = atomic_load(&s->pg_errors);
+    out->events_lost      = atomic_load(&s->events_lost);
 }

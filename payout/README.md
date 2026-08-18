@@ -34,68 +34,190 @@ PAYOUT_DRY_RUN=1 PAYOUT_DB_PATH=../data/shares.db \
 | --- | --- | --- | --- |
 | `PAYOUT_DB_PATH` | yes | — | path to `data/shares.db` (writable) |
 | `THUNDER_RPC_URL` | yes | — | Thunder JSON-RPC endpoint, e.g. `http://127.0.0.1:6009` |
-| `THUNDER_FROM_ADDRESS` | yes | — | pool reserve address; must equal `pool_thunder_reserve_address` in `proxy.conf` |
+| `THUNDER_FROM_ADDRESS` | yes | — | pool reserve address; must equal the dashboard's `POOL_THUNDER_RESERVE_ADDRESS` |
 | `THUNDER_RPC_USER` / `THUNDER_RPC_PASS` | no | — | basic-auth if your Thunder node has it (default Thunder build has none) |
-| `PAYOUT_INTERVAL_MS` | no | 30000 | how often to scan |
+| `PAYOUT_INTERVAL_MS` | no | 86400000 (24h) | how often a payout run starts — the batch cadence miners see |
+| `PAYOUT_SETTLE_INTERVAL_MS` | no | 30000 | how often an already-broadcast batch is re-checked while it waits for a Thunder block |
+| `PAYOUT_RETRY_INTERVAL_MS` | no | 300000 | how long to wait after a tick that tried and got nowhere (transfer failed / reserve short) |
 | `PAYOUT_MIN_SATS` | no | 10000 | skip workers below this owed balance |
 | `PAYOUT_MAX_PER_TICK` | no | 50 | cap workers paid per scan |
 | `PAYOUT_DRY_RUN` | no | — | `1` = log only |
 | `PAYOUT_DEBUG` | no | — | `1` = verbose |
+| `PAYOUT_NUDGE_MINE` | no | on | `0` = never ask Thunder to mine |
+| `PAYOUT_NUDGE_INTERVAL_MS` | no | 120000 | floor between mine attempts |
 
 ## What it does each tick
 
-1. `SELECT … FROM pps_credits JOIN workers WHERE accrued - paid >= min`
-2. `thunder.balance()` — bail this tick if the reserve is short
-3. For each due worker: `thunder.transfer(addr, owed, fee)`; on success,
-   `UPDATE pps_credits SET paid_sats = paid_sats + owed`
+1. **Settle** — if a batch is outstanding, ask Thunder whether it has been
+   mined. Confirmed: credit every worker in it now. Still in the mempool:
+   nudge Thunder to mine and stop for this tick. Undeterminable: stop and
+   log loudly (see below).
+2. `SELECT … FROM pps_credits JOIN workers WHERE accrued - paid >= min`,
+   excluding anyone with an in-flight row
+3. `thunder.balance()` — bail this tick if the reserve is short
+4. **Broadcast** everyone due in ONE transaction, and stamp its txid onto
+   their in-flight rows. Nobody is credited here.
 
-Payouts are **not batched** into a single tx — one bad address or RPC
-error must not block other miners.
+Payouts *are* batched into a single transaction. Thunder advances only when
+a mainchain block commits to it and cannot spend the change of an unconfirmed
+transaction, so one tx per worker would cost one sidechain block each and the
+queue would drain slower than it fills. The cost is failure isolation: one bad
+address fails the whole batch. That is the right trade — every recipient is an
+address the proxy validated at authorize time, and a failed batch credits
+nobody and strands nobody.
+
+## Three clocks, not one
+
+Payouts run **once a day**. That is `PAYOUT_INTERVAL_MS`, and it is the only
+cadence a miner ever sees: a single batched transaction every 24h paying
+everyone over `PAYOUT_MIN_SATS`.
+
+The daily interval deliberately does not govern what happens to a batch that
+has already gone out, because two of the states a tick can end in are ruined
+by a long wait:
+
+| after a tick that… | next tick in | why |
+| --- | --- | --- |
+| did nothing, or settled a batch cleanly | `PAYOUT_INTERVAL_MS` (24h) | the ordinary daily cadence |
+| broadcast a batch, or is still waiting on one | `PAYOUT_SETTLE_INTERVAL_MS` (30s) | nobody in the batch is credited until a tick sees it in a Thunder block, and the stall-recovery nudge only fires from a tick |
+| failed to broadcast, or found the reserve short | `PAYOUT_RETRY_INTERVAL_MS` (5m) | nothing was sent and nobody was credited — the run did not happen, so it is retried rather than skipped to tomorrow |
+| could not determine a settlement | `PAYOUT_RETRY_INTERVAL_MS` (5m) | terminal until an operator reconciles; re-logging it every 30s for a day buries everything else |
+
+`nextDelayMs()` in [lib/payout.js](lib/payout.js) is the whole decision, and
+[test/cadence.test.js](test/cadence.test.js) pins each row of that table.
+
+To force a run without waiting for the next one, use the dashboard's
+**Trigger payout now** button (or `POST /payout/run` on the worker's admin
+HTTP surface) — restarting the service also ticks immediately.
+
+## `paid` means mined, not sent
+
+`pps_credits.paid_sats` moves only when a transaction has been observed in a
+block. A payout sitting in a mempool has discharged no debt, so counting it as
+paid makes `accrued - paid` understate what the pool actually owes — measured
+at 265 BTC for over four hours on drynet3 — and leaves no way back if the
+transaction never lands.
+
+Telling "confirmed" from "gone" is the hard part, because Thunder offers no
+single durable answer. Two sources are consulted and only **positive**
+evidence from either is accepted:
+
+- `get_transaction` → `block_hash`. Authoritative but transient: once the
+  sidechain moves past the block, a long-confirmed txid reads back as `null`,
+  byte-identical to one that never existed.
+- The **wallet UTXO set**, where each UTXO records the outpoint that created
+  it. Thunder admits only confirmed UTXOs, so an outpoint bearing our txid is
+  itself the confirmation — and it is durable, because that change output
+  survives until the next payout spends it, which cannot happen until this one
+  is finalized.
+
+Silence is never read as confirmation, and never as eviction either. Inferring
+"it must have been dropped" from a forgotten txid would re-queue a batch that
+had already been paid.
+
+## Nudging Thunder
+
+Thunder advances only when a mainchain block commits to it, and nothing
+schedules that — so without help a broadcast payout waits for a human to press
+a button, and the whole queue waits behind it. The loop calls Thunder's `mine`
+in exactly two places, and **when** it fires matters as much as that it does.
+
+### Once per broadcast, not once per tick
+
+`mine` builds a block body from the mempool *before* it takes the miner lock,
+then parks that snapshot as its BMM request the moment the lock frees:
+
+```rust
+let body = types::Body::new(Vec::new(), coinbase);   // mempool snapshot HERE
+let mut miner_write = miner.write().await;           // then block on the lock
+miner_write.attempt_bmm(bribe.to_sat(), 0, header, body)
+```
+
+So a nudge issued *while waiting* captures a mempool that predates the next
+batch, queues behind the in-flight `mine`, and becomes the parked request the
+instant the current batch confirms. The next batch — broadcast seconds later —
+cannot be in the block that request produces, so it waits for the one after.
+Every payout then costs two sidechain blocks instead of one.
+
+Measured on drynet3 before this was fixed: Thunder parked its request 14–93s
+*ahead* of the broadcast it was meant to carry in 7 of 7 cycles, and 42 Thunder
+blocks produced only 25 settlements.
+
+The loop therefore nudges:
+
+- **right after a broadcast**, so the snapshot contains the batch just sent.
+  Never rate-limited — it is already bounded by the settlement cadence.
+- **to break a stall**, once a batch has sat unconfirmed for
+  `PAYOUT_NUDGE_STALL_SEC` (default 300s), which means its request was not
+  carried and nothing will re-park. Rate-limited by
+  `PAYOUT_NUDGE_INTERVAL_MS`.
+
+Do not lower `PAYOUT_NUDGE_STALL_SEC` towards the tick interval — that
+reintroduces the stale-snapshot problem the split exists to avoid.
+
+It fires only while something is genuinely waiting to settle, so an idle pool
+spends no BMM bids on empty blocks. A failed nudge never fails the tick.
 
 ## At-most-once payout protocol
 
-Every payout flows through three steps so a crash anywhere in the
-middle can't double-pay:
-
-1. `INSERT INTO payouts_in_flight (worker_id, sats, txid='')` — reserve
-   the slot before Thunder is touched. `listDue()` skips any worker
-   with an in-flight row.
-2. `thunder.transfer(addr, sats, fee)` — broadcast. On clean failure
-   (RPC error before a txid is returned), the row is DELETEd and the
-   worker is eligible next tick.
-3. In ONE SQLite transaction: write the txid onto the in-flight row,
-   `paid_sats += sats`, DELETE the in-flight row.
+1. `INSERT INTO payouts_in_flight (worker_id, sats, txid='')` — one row per
+   worker, before Thunder is touched. `listDue()` skips any worker with an
+   in-flight row.
+2. `transferBatchDetailed(recipients, fee)` — broadcast. Three RPCs under the
+   hood (`create_transfer` → `sign_transaction` → `submit_transaction`); only
+   the last can put a tx on the network. On clean failure (an error before a
+   txid is returned) the rows are DELETEd and the workers are eligible next
+   tick.
+3. `attachBatchTxid()` — stamp the txid. The rows **stay** in flight.
+4. On a later tick, once the transaction is confirmed: in ONE SQLite
+   transaction across the whole batch, `paid_sats += sats`, append to
+   `payouts`, DELETE the in-flight rows.
 
 Crash semantics:
 
 | crash point | row state | action |
 | --- | --- | --- |
-| after (1), before (2) | txid='' | manual: did broadcast happen? unlikely. delete row. |
-| after (2), before (3) | txid='<id>' | manual: tx is on Thunder — finalize by hand. |
-| inside (3) | atomic — either fully applied or fully rolled back | nothing |
+| after (1), before (2) | `txid=''` | manual: did the broadcast happen? |
+| after (2), before (3) | `txid=''` | manual: same question, narrower window |
+| after (3), before (4) | `txid` set | none — this is the ordinary waiting state |
+| inside (4) | atomic across the batch — fully applied or fully rolled back | none |
 
-On startup the worker calls `reportStuck()` which logs every in-flight
-row older than 5 minutes. Operator-driven reconciliation only; we
-never silently auto-finalize because we cannot safely distinguish
-"broadcast didn't happen" from "broadcast happened, finalize crashed"
-without Thunder-side mempool/chain lookup.
+`reportStuck()` logs in-flight rows older than 5 minutes **that have no
+txid**. Rows with a txid are routinely hours old — Thunder produces only a
+handful of blocks a day — and reporting them would bury the one row that
+actually needs a human.
 
-To reconcile a stuck row by hand once you've confirmed via the Thunder
-node whether the tx is live:
+### Reconciling by hand
 
-```
-# if the tx exists on Thunder: finalize manually
-sqlite3 data/shares.db "
-  BEGIN;
-  UPDATE pps_credits   SET paid_sats = paid_sats + (SELECT sats FROM payouts_in_flight WHERE id = <id>)
-                       WHERE worker_id = (SELECT worker_id FROM payouts_in_flight WHERE id = <id>);
-  DELETE FROM payouts_in_flight WHERE id = <id>;
-  COMMIT;
-"
+Two situations need an operator. Neither is auto-resolved, because both turn
+on a question only a human can answer: *did this transaction make it onto the
+sidechain?*
 
-# if the tx never made it: just delete the row
+**A row with no txid.** The worker died around the broadcast, so it is unknown
+whether anything went out. Check the Thunder node, then:
+
+```sh
+# the tx is live or mined — adopt it, and the normal settle path takes over
+sqlite3 data/shares.db "UPDATE payouts_in_flight SET txid = '<txid>' WHERE id = <id>;"
+
+# it never went out — release the workers to be paid again next tick
 sqlite3 data/shares.db "DELETE FROM payouts_in_flight WHERE id = <id>;"
 ```
+
+**`CANNOT DETERMINE settlement`.** The loop can see neither the transaction
+nor any wallet UTXO from it, so it has halted payouts rather than guess.
+Establish the truth first — the recipients' balances are the ground truth:
+
+```sh
+CLI=…/thunder_app_cli
+sudo -u forknet $CLI get-transaction <txid>      # non-null = still in mempool
+sudo -u forknet $CLI get-wallet-utxos | grep <txid>
+```
+
+If it was mined, finalize the batch by hand (all rows sharing the txid, in one
+transaction). If it truly never landed, `DELETE` those rows and the workers are
+paid again on the next tick. Do not delete rows you have not positively shown
+to be unmined — that is how a batch gets paid twice.
 
 ## Block-withholding audit (`audit.js`)
 
