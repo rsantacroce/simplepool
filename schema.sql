@@ -43,6 +43,29 @@ CREATE TABLE IF NOT EXISTS rejects (
 );
 CREATE INDEX IF NOT EXISTS rejects_ts_idx ON rejects(ts);
 
+-- A row here is a block CANDIDATE, not a block. A share meeting network
+-- difficulty produces one, and submitblock refuses stale, duplicate and
+-- high-hash candidates routinely — on a low-difficulty chain that is nearly
+-- every one of them. `status` is what separates the two, and every count and
+-- every sum of reward_sats MUST filter on status='confirmed':
+--
+--   pending    submitted and accepted by the node, not yet verified to be in
+--              the chain. NOT revenue. Against a backend that answers only
+--              getblocktemplate/submitblock there may be nothing able to
+--              verify it for some time, so this is a normal steady state
+--              rather than a transient.
+--   confirmed  verified to be in the chain. The only status worth money.
+--   orphaned   was in the chain, then reorged out. Earns nothing.
+--   rejected   submitblock refused it; submit_error carries the reason.
+--
+-- checked_via records who answered: 'node' (getblockhash) or 'tips' (the
+-- observed chain of getblocktemplate prev_hashes, used when the backend does
+-- not serve getblockhash) — the same distinction pool_meta.network_source
+-- draws between an authoritative answer and an inferred one.
+--
+-- Several rows per height is expected, not a bug: on a low-difficulty chain
+-- the pool genuinely finds competing candidates at one height. At most one of
+-- them can be 'confirmed'.
 CREATE TABLE IF NOT EXISTS blocks_found (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   ts              INTEGER NOT NULL,
@@ -51,9 +74,36 @@ CREATE TABLE IF NOT EXISTS blocks_found (
   finder_id       INTEGER REFERENCES workers(id),
   finder_address  TEXT,
   reward_sats     INTEGER,
-  fee_sats        INTEGER
+  fee_sats        INTEGER,
+  status          TEXT NOT NULL DEFAULT 'pending',
+  confirmations   INTEGER NOT NULL DEFAULT 0,
+  /* PPLNS distribution. Zero in every other mode.
+   *
+   * pplns_window_diff is the window size in difficulty units, snapshotted
+   * when the block was found rather than recomputed when it is paid out.
+   * Those moments are ~100 blocks apart and the chain can retarget between
+   * them, so recomputing would pay a block across a window its own miners
+   * never worked under. Stored, the split is reproducible from the row.
+   *
+   * pplns_distributed is the exactly-once latch. Crediting is additive, so a
+   * second pass over the same block doubles every balance and leaves no
+   * trace in the amounts themselves. */
+  pplns_window_diff REAL    NOT NULL DEFAULT 0,
+  pplns_distributed INTEGER NOT NULL DEFAULT 0,
+  submit_error    TEXT,
+  checked_via     TEXT
 );
 CREATE INDEX IF NOT EXISTS blocks_found_ts_idx ON blocks_found(ts);
+CREATE INDEX IF NOT EXISTS blocks_found_status_idx ON blocks_found(status);
+CREATE INDEX IF NOT EXISTS blocks_found_pplns_idx ON blocks_found(pplns_distributed, status);
+/* blocks_found also carries a UNIQUE index on hash, blocks_found_hash_idx,
+ * which is deliberately NOT created here. Databases written before it existed
+ * can hold the same hash twice, and a CREATE UNIQUE INDEX over them fails --
+ * which, since install.sh applies this file under `set -e` on every upgrade,
+ * would abort the upgrade half-done. The proxy creates it at startup instead
+ * (store_finalize_block_hash_index), after collapsing any duplicates onto the
+ * earliest row and carrying their verdict with it. Deleting rows is not
+ * something this file may do: it is also run against a live shares.db. */
 
 /* Single-row mirror of the upstream bitcoind tip the proxy is currently
  * mining on. Written by the proxy's tip watcher on every successful
@@ -83,7 +133,31 @@ CREATE TABLE IF NOT EXISTS node_status (
  * which shares.credited_sats is populated. */
 CREATE TABLE IF NOT EXISTS pool_meta (
   id                  INTEGER PRIMARY KEY CHECK (id = 1),
+  /* Pool identity — what the proxy is configured to be, written once at
+   * startup rather than on the template path. A miner cannot tell any of
+   * this from the stratum URL, so the dashboard has to say it: which chain
+   * the coinbase is being built for, whose tag is in it, and where the
+   * money goes. network_source is 'node' (getblockchaininfo answered) or
+   * 'inferred' (it did not, and the network was read off the operator
+   * address, which cannot distinguish testnet from signet). */
+  network             TEXT,
+  network_source      TEXT,     /* 'node' | 'inferred' */
+  coinbase_tag        TEXT,
+  operator_address    TEXT,     /* fee_bps recipient */
+  pool_btc_address    TEXT,     /* pps-classic only; NULL in solo */
   pool_mode           TEXT,
+  /* pplns-coinbase only; NULL in every other mode. The least a claim must be
+   * worth to get a coinbase output at all -- below it a miner is not paid BY
+   * THAT BLOCK. Its share goes to the other miners in the window, never to
+   * the operator, and the miner is recorded in pplns_fractions as owed a
+   * turn, so a later block with room reaches it first. Being small costs
+   * frequency, not money.
+   *
+   * Published here because the miner it costs reads the dashboard, not the
+   * operator's log. A floor nobody can see from outside is not a policy, it
+   * is a surprise, and the whole case for having one is that it is stated up
+   * front. */
+  pplns_payout_floor_sats INTEGER,
   fee_bps             INTEGER,
   rate_source         TEXT,     /* 'derived' | 'override' */
   rate_sats_per_diff  REAL,     /* effective, net of fee; 0 in solo */
@@ -95,7 +169,14 @@ CREATE TABLE IF NOT EXISTS pool_meta (
   /* Mirror of the proxy's in-memory events_lost counter: accepted shares that
    * never reached the DB after every commit retry failed. Must be 0 — it is
    * work a miner was told was accepted and that no query can otherwise see. */
-  events_lost         INTEGER NOT NULL DEFAULT 0,  /* unix seconds */
+  events_lost         INTEGER NOT NULL DEFAULT 0,  /* count of events */
+  /* The stratum ports this pool listens on and the difficulty policy of
+   * each, as a JSON array of {port, label, min_diff, initial_diff}. Written
+   * at startup with the rest of the identity. A miner cannot tell from the
+   * URL it was handed which port suits its hardware -- a home ASIC and a
+   * rented fleet want opposite difficulties -- so the dashboard has to say
+   * it, and it can only say what the proxy published. */
+  listeners           TEXT,
   updated_at          INTEGER   /* unix seconds */
 );
 
@@ -259,3 +340,56 @@ CREATE TABLE IF NOT EXISTS tx_attempts (
 );
 CREATE INDEX IF NOT EXISTS tx_attempts_ts_idx   ON tx_attempts(ts);
 CREATE INDEX IF NOT EXISTS tx_attempts_kind_idx ON tx_attempts(kind, ts);
+
+-- pplns-coinbase: who has been skipped, and by how much.
+--
+-- A signed fraction of ONE block reward per worker. Positive means the miner
+-- was skipped -- the coinbase had no room for it -- and is first in the queue
+-- for a slot in a future block. Negative means it was paid early, out of
+-- somebody else's skipped share, and waits its turn. The column sums to zero
+-- across the table.
+--
+-- THIS IS NOT A BALANCE AND THE POOL HOLDS NO MONEY AGAINST IT. Nothing is
+-- ever withheld from a coinbase and released later; that would need a block
+-- paying less than the reward followed by one paying more, and the second is
+-- invalid. It is a memory of who was skipped, used only to order the next
+-- block's payouts. If this file were deleted nobody would be owed a payment,
+-- because nobody was ever holding one -- the pool would simply forget whose
+-- turn it was.
+--
+-- Recorded as a fraction rather than in difficulty units on purpose. Shares
+-- stay in the window across several blocks, so rolling unpaid difficulty
+-- forward would count the same work twice; and difficulty is not comparable
+-- over time -- it swings, and it resets at a fork -- so a claim stored in
+-- difficulty units quietly changes meaning at every retarget. A fraction of a
+-- block reward does not.
+CREATE TABLE IF NOT EXISTS pplns_fractions (
+  worker_id     INTEGER PRIMARY KEY REFERENCES workers(id),
+  owed_fraction REAL    NOT NULL DEFAULT 0,
+  updated_at    INTEGER
+);
+
+-- What a block's coinbase did to those fractions, held until the block is
+-- known to have survived.
+--
+-- Written when a block is found, which is a CANDIDATE: submitblock may have
+-- refused it, or the chain may reorg it away, and either way its coinbase
+-- paid nobody. Applying the deltas there would record a rotation that never
+-- happened and quietly move somebody down the queue for a payment they never
+-- received. The confirmation pass applies these when the block is confirmed
+-- and deletes them when it is orphaned -- the same rule, and the same reason,
+-- as PPLNS distribution.
+--
+-- "Confirmed" here is ONE block deep, not the distributor's hundred: the queue
+-- must describe the last block before the next one is built, and nothing here
+-- is money. So a block reorged out after that first confirmation keeps its
+-- rotation. That is one turn out of order, corrected by the next block found,
+-- and never a satoshi.
+CREATE TABLE IF NOT EXISTS pplns_pending_fractions (
+  block_hash TEXT    NOT NULL,
+  worker_id  INTEGER NOT NULL,
+  delta      REAL    NOT NULL,
+  PRIMARY KEY (block_hash, worker_id)
+);
+CREATE INDEX IF NOT EXISTS pplns_pending_hash_idx
+  ON pplns_pending_fractions(block_hash);

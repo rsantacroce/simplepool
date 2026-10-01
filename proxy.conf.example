@@ -1,6 +1,10 @@
 listen_addr = 0.0.0.0
 listen_port = 3334
 
+# Maximum concurrent stratum connections, across every listener. A connection
+# past this is closed immediately at accept. Each one costs a thread and an fd.
+max_conns = 500
+
 bitcoind_url = http://127.0.0.1:18443
 # bitcoind_user / bitcoind_pass are optional. Omit BOTH for a block-template
 # backend that doesn't require authentication; the RPC call is then made
@@ -26,12 +30,141 @@ coinbase_tag = /simplepool/
 # vardiff — auto-adjust each connection's difficulty to keep the share
 # rate near `target_spm` shares/minute. Set vardiff_enabled = 0 to pin
 # every connection to initial_diff (legacy behaviour).
+#
+# These are the settings for listen_port, which is the port home miners are
+# pointed at. Rented hashrate does not belong here — give it its own listener
+# below, with its own floor.
 initial_diff       = 1
 vardiff_enabled    = 1
 vardiff_target_spm = 12       # ~1 share every 5 seconds per connection
 vardiff_min        = 1
 vardiff_max        = 1e12
 vardiff_window_sec = 30       # how often to retarget
+
+# How many accepted shares a window must hold before its rate is trusted
+# enough to act on. At the defaults above an ON-TARGET connection produces
+# six shares a window, and Poisson noise on six samples is +/-41%, so the
+# measured rate leaves the retarget deadband on noise alone and the
+# difficulty oscillates around the right answer instead of settling on it.
+#
+# Under the floor the window stays OPEN and keeps accumulating, for up to
+# vardiff_max_window_mult windows -- after which it acts on what it has, so a
+# connection whose difficulty really is far too high still ratchets down.
+#
+# 0 restores the previous behaviour exactly.
+vardiff_min_samples = 20
+vardiff_max_window_mult = 8
+
+# Largest difficulty step a window that never met the sample floor may make.
+# A window that met it keeps the historical 4x. This is what stops a quiet
+# connection being driven to vardiff_min: one rig behind a proxy arrives as
+# many connections, each going quiet between bursts, and at 4x two near-empty
+# windows cut its difficulty 16x.
+vardiff_idle_step = 2
+
+# Extra stratum ports, each with its own difficulty policy. Repeatable —
+# unlike every other key here, a second `listener` line adds a port rather
+# than replacing the first. listen_port above is always served too, on the
+# settings above.
+# At most 7 listener lines: listen_port takes the eighth port slot.
+#
+#   port           the port to bind (required)
+#   min_diff       vardiff floor for this port, and its starting difficulty
+#   initial_diff   starting difficulty, if it should differ from min_diff
+#   max_diff       vardiff ceiling for this port
+#   label          shown in the log and on the dashboard; [A-Za-z0-9_-]
+#
+# Why a second port at all: one difficulty cannot serve both a home ASIC and
+# rented hashrate. Rented hashrate does not arrive as many small miners — a
+# marketplace aggregates a whole fleet behind one connection, and 1 PH/s at
+# difficulty 1024 is ~227 shares per SECOND down that single socket. The
+# marketplaces know this and refuse to deliver to a pool below their floor:
+# Braiins wants at least 1024 and recommends 65536, NiceHash requires 500000.
+#
+# Vardiff cannot bridge the gap. It moves by at most 4x per window, so at the
+# 30s default it takes eight windows — four minutes — to climb from 1 to
+# 65536, and the reject flood on the way there is what gets an order
+# cancelled. The miner has to arrive at the right difficulty, which is what a
+# dedicated port is for.
+#
+# listener = port=3335 min_diff=65536 label=braiins
+# listener = port=3336 min_diff=500000 label=nicehash
+#
+# IMPORTANT — min_diff is KEPT even when the chain is easier than it, and
+# that costs blocks. Share difficulty is otherwise capped at the network
+# difficulty, because a miner filters locally against the stratum target and
+# a harder share target makes it discard valid blocks before the pool ever
+# sees them. min_diff overrides that cap, on purpose: a marketplace measures
+# the difficulty on the wire, so a 500000 port that quietly served 1200 would
+# have its order cancelled and the pool would never learn why.
+#
+# The trade is therefore explicit and confined to the ports that ask for it.
+# On a 500000 port over a chain at 1200, miners discard roughly 416 of every
+# 417 blocks they solve. simplepool warns at startup for every listener in
+# that position, and the dashboard reports it too (the "Stratum ports can
+# hold their difficulty" health check). If keeping every block matters more
+# to you than serving rented hashrate on that port, drop its min_diff — the
+# cap then applies as it always has.
+#
+# listen_port and any listener without a min_diff are untouched by all of
+# this: no floor, cap as before.
+
+# Ceiling on mining.submit per second, per connection. 0 disables it.
+#
+# A connection's share rate is its hashrate divided by the difficulty it was
+# assigned, and nothing stops those from being badly mismatched — an
+# aggregated fleet pointed at a home-miner port is 1 PH/s against difficulty
+# 1, which is ~232,000 submits per second down one socket. Validating a submit
+# costs about 9 microseconds, so that one connection asks for more than two
+# cores, and every share it lands passes through the store's ring, which drops
+# events once full: work a miner was told was accepted, never credited.
+#
+# The default is far above anything a correctly configured miner reaches. With
+# vardiff on, the steady state is vardiff_target_spm — 0.2/s at the default —
+# for a connection of ANY size, because that is what vardiff converges on. The
+# only rates that come near this ceiling are transients while vardiff climbs,
+# and they only get near it when the difficulty is already badly wrong. For
+# scale, the largest plausible legitimate burst — 1 EH/s at difficulty
+# 65536, before vardiff has raised it — is about 3,500/s.
+#
+# Raise it if you pin a low difficulty for a very large miner
+# (vardiff_enabled = 0), since then a high sustained rate is the correct
+# behaviour rather than a symptom.
+max_submits_per_sec = 20000
+
+# Budget for mining.authorize. A failed authorize is the cheapest write on the
+# pool -- a reject observation and a log line -- and until this existed nothing
+# bounded how many of them one client could buy before authenticating at all.
+#
+# The third failure on a connection is answered and the connection is then
+# closed. An address that has failed three times inside the lockout window is
+# refused before its next attempt is even parsed, until the window passes. A
+# successful authorize forgives the address, so a miner that fixes a typo is
+# not made to wait.
+#
+# 0 disables both halves. A correct miner never reaches either.
+auth_max_failures = 3
+auth_fail_lockout_sec = 60
+
+# Idle-connection reaper, in seconds. Two budgets, because the two states are
+# not the same risk:
+#
+#   idle_timeout_sec            a socket that has not authorized. It has told
+#                               us nothing and costs an fd for nothing.
+#   idle_timeout_authorized_sec a miner that HAS authorized. Having nothing to
+#                               say is its normal resting state — the pool
+#                               asks it nothing between shares — so a small
+#                               rig that has not cleared its assigned
+#                               difficulty yet is silent but perfectly
+#                               healthy. Reaping it on the short budget
+#                               disconnects working hashrate, which is one of
+#                               the behaviours marketplaces delist pools for.
+#
+# TCP keepalive (2 min idle + 3x30s probes) already reaps a socket whose peer
+# is genuinely gone, so the long budget only has to catch a peer answering
+# keepalives while doing no work. Negative disables either one.
+idle_timeout_sec            = 600
+idle_timeout_authorized_sec = 7200
 
 db_path = ./data/shares.db
 commit_window_ms = 100
@@ -55,6 +188,38 @@ redis_reconnect_backoff_ms = 2000
 # pool_mode controls the coinbase shape and the username validation:
 #   solo        default. Coinbase pays the miner (stratum username is a
 #               BTC address) minus the operator fee. No PPS accrual.
+#   pplns-thunder / pplns-btc
+#               Pay Per Last N Shares. The coinbase pays pool_btc_address, as
+#               in pps-classic, but nothing is credited when a share arrives.
+#               When a block matures, the reward and its transaction fees are
+#               split across everyone whose shares fall inside the last-N
+#               window, in proportion to the difficulty each contributed.
+#
+#               The difference that matters to an operator is who carries the
+#               variance. PPS guarantees a price per share, so a run of bad
+#               luck is the operator's problem and has to be absorbed by a
+#               reserve measured in block rewards. PPLNS never owes more than
+#               it has just been paid, so there is no reserve to size and
+#               operator ruin is not a failure mode. The miners carry the
+#               variance instead, which is why the fee is normally set lower
+#               than under PPS -- there is no risk premium to charge.
+#
+#               The suffix picks the payout rail, and it is one knob rather
+#               than two because a pool runs one or the other: the rail
+#               decides what a stratum username IS. pplns-thunder takes
+#               Thunder addresses and pays over Thunder, exactly as
+#               pps-classic does. pplns-btc takes Bitcoin addresses and pays
+#               on L1.
+#
+#               pplns-btc needs the bip300301_enforcer running with
+#               --enable-wallet, and pool_btc_address set to an address from
+#               that wallet (WalletService/CreateNewAddress). The pool holds
+#               no keys and builds no transactions: the coinbase pays into
+#               the enforcer's wallet, and paying miners is one RPC to
+#               WalletService/SendTransaction, which selects the inputs,
+#               signs and broadcasts. The payout worker needs PAYOUT_RAIL=btc
+#               and ENFORCER_RPC_ADDR to match — see payout/README.md.
+#
 #   pps-classic Coinbase pays a pool BTC address (pool_btc_address below)
 #               as a normal P2WPKH/P2PKH output. Miners authorize with a
 #               Thunder address (base58 of a 20-byte hash) and accrue in
@@ -63,8 +228,88 @@ redis_reconnect_backoff_ms = 2000
 #               drains that reserve to miners.
 pool_mode = solo
 
-# pps-classic — required
+# pps-classic and both pplns modes — required
 # pool_btc_address = REPLACE_WITH_POOL_BTC_ADDRESS
+
+# pplns — the window, as a multiple of the CURRENT network difficulty.
+# 2.0 means "the last two blocks' worth of expected work".
+#
+# A multiple rather than an absolute share count or difficulty sum, because it
+# self-scales across retargets. An absolute window silently changes meaning
+# every time the chain retargets: on a forknet moving 4x it becomes four times
+# longer or shorter than the operator chose, with nothing in the config having
+# changed to say so.
+#
+# Below 1.0 the window covers less work than a block is expected to take, so a
+# block pays out across less work than it took to find. That rewards whoever
+# happened to be connected at the moment over the work that actually produced
+# the block -- which is the pool-hopping incentive PPLNS exists to remove. The
+# proxy warns if you set it there.
+# pplns_window_diff_multiple = 2.0
+
+# pplns-coinbase — the byte budget for the WHOLE serialized coinbase, which is
+# what actually limits how many miners one block can pay.
+#
+# Not a consensus limit. Consensus bounds the coinbase by block weight and
+# would allow far more; the real constraint is that rented-hashrate
+# marketplaces verify the coinbase and refuse a job whose coinbase they
+# consider oversized, and a delisting costs more than paying a few small
+# miners a block later.
+#
+# Counted in bytes rather than in outputs because outputs are not the only
+# thing spending them. On a drivechain pool the binding term is the BIP300/301
+# commitment OP_RETURNs the enforcer's template already carries: a
+# coinbase-direct pool in production reports the same 16 payouts costing 817
+# bytes against four of them and 769 against three. A cap counted in outputs
+# cannot see that; this can, because the commitments are simply part of what
+# has already been spent.
+#
+# Whatever does not fit is redistributed across the miners it could pay — see
+# pplns_payout_floor_sats below.
+#
+# Settable PER LISTENER, and usually should be. The ceiling that actually binds
+# is a marketplace rule enforced on the port rented hashrate connects to, and
+# every byte of it costs a payout: at 400 bytes a 100-miner window pays 9, at
+# 3000 it pays 93. There is no reason to make your own miners live under a
+# limit their port is not measured against:
+#
+#   coinbase_max_bytes = 3000
+#   listener = port=3335 label=rental min_diff=500000 initial_diff=500000 max_coinbase_bytes=900
+#
+# A listener that sets none uses the server-wide value below.
+# coinbase_max_bytes = 1000
+
+# pplns-coinbase — the payout floor, in satoshis. A miner whose share of a
+# block is worth less than this gets no output in THAT block.
+#
+# What it was owed is not lost and does not go to you: it is shared out among
+# the miners that block could pay, and the skipped miner goes first in the
+# queue for the next one. You take your fee and nothing else, at every byte
+# budget.
+#
+# That queue is `pplns_fractions` in the database — a signed fraction of one
+# block reward per worker, positive if skipped and negative if paid early out
+# of someone else's skipped share, summing to zero. A quarter of every
+# coinbase's payout slots are reserved for whoever has waited longest, because
+# a miner's share of the window tracks its hashrate: without that, the largest
+# claims take the same slots in every block and the same addresses are never
+# paid at all.
+#
+# It is NOT a balance and you hold nothing against it. Nothing is ever withheld
+# from a coinbase and released later — that would need a block paying less than
+# the reward followed by one paying more, and the second is invalid. Delete the
+# table and nobody is owed a payment; the pool just forgets whose turn it was.
+# Rows are staged when a block is found and applied only once it confirms, so
+# an orphaned block rotates nobody. Confirmed means one block deep, so a block
+# reorged out AFTER that keeps its rotation: one turn out of order, never a
+# satoshi, and corrected by the next block found.
+#
+# So being small here costs a miner FREQUENCY, not money. Say that on your
+# pool page — the proxy states the floor at startup, per template, per block,
+# and on the dashboard, but only you can put it where a miner looks first.
+#
+# Clamped up to 546 (the dust limit) — no smaller output is relayable anyway.
+# pplns_payout_floor_sats = 546
 
 # pps-classic — OPTIONAL rate override, sats credited per unit of share
 # difficulty. Leave it commented out and the proxy derives the rate from each
@@ -78,5 +323,52 @@ pool_mode = solo
 # proxy logs the fee your value actually implies and warns when it disagrees
 # with fee_bps. Prefer leaving it unset.
 # pps_sats_per_diff = 1000
+
+# pps-classic — READ THIS BEFORE RUNNING PPS ON A NEW CHAIN.
+#
+# The derived rate is block_value / network_difficulty, which is a share's
+# expected value. That is correct only while every share the pool produces has
+# a real chance of becoming a block — which needs difficulty to be calibrated
+# to hashrate. On a young chain it is not: difficulty starts at 1 and climbs,
+# and until it catches up the pool produces solutions far faster than the chain
+# can accept blocks. The formula does not know that, and prices every share as
+# though it were worth a whole block.
+#
+# This is not theoretical. A 40 TH/s pool on a forknet that began at difficulty
+# 1 accrued 15,561,471 BTC of liability in under four hours, against 943.60 BTC
+# it had actually mined. Nothing was paid out only because the payout worker
+# had not run yet.
+#
+# Set the floor to the difficulty at which YOUR pool alone would find one block
+# per block interval:
+#
+#     pps_min_network_difficulty = hashrate_in_H/s * block_interval_sec / 2^32
+#
+#   10 TH/s  ->  ~1,400,000        100 TH/s ->  ~14,000,000
+#   40 TH/s  ->  ~5,600,000          1 PH/s ->  ~140,000,000
+#
+# That is a FLOOR, not a target — you share the chain with other miners, so the
+# genuinely safe difficulty is higher. Below it the proxy credits nothing and,
+# by default, refuses new miners rather than taking work it will not pay for.
+# It resumes on its own once the chain retargets, and logs the difficulty it
+# observes to be necessary either way.
+#
+# 0 (the default) disables the check. That is only safe on a chain whose
+# difficulty is already calibrated: mainnet, testnet, signet. The proxy also
+# applies an automatic ceiling that caps accrual at what the chain can mint,
+# but that needs a minute of hashrate history — it cannot protect the first
+# shares after a restart. This floor is what does.
+# pps_min_network_difficulty = 5600000
+
+# Target seconds between blocks. 600 for Bitcoin and every chain forked from
+# it. Only change this for a chain that genuinely retargets to a different
+# interval — it feeds both the floor above and the issuance ceiling.
+# block_interval_sec = 600
+
+# While accrual is suspended by the floor, refuse mining.authorize and reject
+# submits, so miners point elsewhere instead of hashing uncredited. Default on.
+# Turn it off only if the miners are yours and you know they are working for
+# nothing.
+# pps_refuse_shares_below_min = 1
 
 log_level = info

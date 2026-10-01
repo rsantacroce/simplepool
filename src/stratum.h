@@ -3,9 +3,38 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
+#include "coinbase.h"   /* coinbase_payee_t */
+
 typedef struct stratum_job stratum_job_t;
+
+/* The extranonce split, advertised on mining.subscribe and baked into every
+ * per-connection coinbase.
+ *
+ * extranonce1 is the pool's per-connection identifier; it must be unique
+ * across live connections or two miners render identical coinbases (see
+ * handle_subscribe). extranonce2 is the miner's private search field: it
+ * owns those bytes and sweeps them freely.
+ *
+ * extranonce2 is 8 bytes rather than the classic 4. Raw search space is not
+ * the reason -- 4 bytes already gives one connection 2^80 headers per job,
+ * which no hashrate exhausts. The reason is subdivision: a stratum proxy in
+ * front of the pool carves extranonce2 into a downstream-miner id (high
+ * bytes) plus the downstream miner's own extranonce2 (low bytes). At 4 bytes
+ * a proxy spending 3 on addressing leaves its miners a single byte, which
+ * some firmware refuses to run with. At 8 it can spend 3 and still hand down
+ * the conventional 4, so downstream miners see an ordinary pool.
+ *
+ * Widening these is a consensus-relevant change, not a cosmetic one: cb1
+ * carries the scriptSig length varint computed from en1_size + en2_size, so
+ * a submitted extranonce2 of any other length yields a coinbase whose
+ * declared scriptSig length disagrees with its contents. handle_submit
+ * rejects on length for exactly that reason. Keep the coinbase scriptSig
+ * (BIP34 height push + coinbase_tag + en1 + en2) within 100 bytes. */
+#define STRATUM_EXTRANONCE1_SIZE 4
+#define STRATUM_EXTRANONCE2_SIZE 8
 
 /* Create a job from template fields. The coinbase is *not* baked into the
  * job — each connection renders its own coinbase paying its miner address
@@ -13,7 +42,7 @@ typedef struct stratum_job stratum_job_t;
  * the server needs to materialise a per-connection coinbase on demand:
  *   - value_sats:           coinbasevalue from getblocktemplate
  *   - witness_commitment_hex: optional, may be NULL
- *   - en1_size / en2_size:  extranonce sizes, both currently 4
+ *   - en1_size / en2_size:  extranonce sizes; see STRATUM_EXTRANONCE*_SIZE
  *
  * tx_hex_list may be NULL if tx_count == 0. The job takes ownership of
  * its own heap copies; caller's buffers are not retained.
@@ -37,6 +66,21 @@ stratum_job_t *stratum_job_new(
     const char *const *tx_hex_list, size_t tx_count,
     const char *coinbasetxn_hex, int coinbase_has_witness);
 
+/* Attach the PPLNS window this job's block would pay, for pool_mode =
+ * pplns-coinbase. The job takes its own copy of both the amounts and the
+ * addresses, so the caller's array can be stack-allocated and reused.
+ *
+ * Called once, before the job is published — the window is a SNAPSHOT taken
+ * when the template was built, not a live view. A miner that connects after
+ * the job went out is not in that job's coinbase and is not paid by a block
+ * found against it; it is picked up by the next template. The refresh cadence
+ * is what bounds how stale that snapshot gets.
+ *
+ * Returns 0 on success, negative on allocation failure. */
+int stratum_job_set_window(stratum_job_t *j,
+                           const coinbase_payee_t *payees,
+                           const int64_t *worker_ids, size_t n_payees);
+
 void stratum_job_free(stratum_job_t *j);
 
 /* Observer hooks filled in by main.c (typically routed to the sqlite store). */
@@ -46,30 +90,116 @@ typedef void (*share_observer_fn)(void *ctx, const char *worker_name,
                                   int is_block, const char *block_hash_or_null);
 typedef void (*reject_observer_fn)(void *ctx, const char *worker_name,
                                    uint64_t ts_ms, const char *reason);
-typedef void (*block_submit_fn)(void *ctx, const char *block_hex);
-/* Fires once per solved block, after the share has been recorded. Used by
- * main.c to insert into blocks_found with reward/fee/finder address. */
+/* Submits the assembled block upstream. Returns 0 when the node accepted it,
+ * non-zero when it refused, filling errbuf with the node's reason.
+ *
+ * The result is not advisory. A share meeting network difficulty makes a
+ * *candidate*, not a block: submitblock refuses stale, duplicate and
+ * high-hash candidates routinely, and on a low-difficulty chain that is the
+ * common case. Recording one as a block credits the pool with revenue that
+ * never existed. */
+typedef int (*block_submit_fn)(void *ctx, const char *block_hex,
+                               char *errbuf, size_t errlen);
+/* Fires once per block candidate, after the share has been recorded. Used by
+ * main.c to insert into blocks_found with reward/fee/finder address.
+ *
+ * `accepted` is whether on_block's submission was taken by the node, and
+ * `submit_error` the reason when it was not. A candidate the node refused is
+ * still reported here — it is recorded as 'rejected' rather than dropped,
+ * because a silent reject is how phantom rewards went unnoticed. */
+/* What a found block's coinbase did to each miner's standing in the queue, as
+ * signed fractions of one block reward that sum to zero. The callback stages
+ * them against the block hash; the confirmation pass decides whether they ever
+ * take effect. pplns-coinbase only. */
+struct store_fraction_delta;
+typedef void (*window_fractions_fn)(void *ctx, const char *block_hash,
+                                    const struct store_fraction_delta *deltas,
+                                    size_t n);
+
 typedef void (*block_found_fn)(void *ctx,
                                const char *worker_name,
                                const char *finder_address,
                                uint64_t ts_ms, uint32_t height,
                                const char *block_hash,
-                               int64_t reward_sats, int64_t fee_sats);
+                               int64_t reward_sats, int64_t fee_sats,
+                               int accepted, const char *submit_error);
+
+/* A listening port and the difficulty policy for the miners that arrive on
+ * it. The pool serves one kind of miner badly if it serves only one policy:
+ * a home ASIC needs a difficulty low enough to report shares regularly, and
+ * an aggregated fleet from a hashrate marketplace needs one high enough that
+ * its share rate stays sane -- 1 PH/s at difficulty 1024 is ~227 shares per
+ * second down a single connection, and the marketplaces refuse to deliver
+ * below their own floor for exactly that reason.
+ *
+ * One difficulty cannot be both, and vardiff cannot bridge it: it moves by at
+ * most 4x per window, so climbing from 1 to 65536 takes eight windows -- four
+ * minutes at the default -- and the reject flood on the way there is what
+ * gets a rented order cancelled. Hence a port per policy, each one already at
+ * the right difficulty when the miner connects.
+ *
+ * A field left at 0 falls back to the server-wide default. */
+typedef struct {
+    int    port;
+    double initial_diff;
+    double vardiff_min;
+    double vardiff_max;
+    /* The floor this port promises, set only when the operator wrote
+     * min_diff=. Unlike vardiff_min — which merely bounds the rate loop, and
+     * which the network-difficulty ceiling overrides — this one is kept even
+     * when the chain's own difficulty is lower, because a marketplace
+     * measures the difficulty on the wire and cancels an order that comes in
+     * under what the port advertised. Left 0 by any listener that did not ask
+     * for one, which is how the default port and every low-difficulty chain
+     * keep their existing behaviour. See clamp_assigned_difficulty. */
+    double min_diff;
+    /* This port's coinbase byte ceiling, overriding the server-wide
+     * coinbase_max_bytes. 0 means "use the server-wide one".
+     *
+     * Here for the same reason min_diff is: the ceiling that actually binds is
+     * a MARKETPLACE rule, enforced by whoever is renting you hashrate, and it
+     * only applies to the port they connect to. A byte ceiling costs payouts —
+     * every miner it cuts is one the block cannot pay — so applying a
+     * rental market's limit to your own miners' port buys nothing and costs
+     * them their slots (LayerTwo-Labs/simplepool#76). Set it tight on the
+     * rented port and leave it alone everywhere else. */
+    int    max_coinbase_bytes;
+    /* Free-form, for logs and for the dashboard to tell miners which port to
+     * point which machine at. Empty for the default listener. */
+    char   label[32];
+} stratum_listener_t;
+
+#define STRATUM_MAX_LISTENERS 8
+/* How many `listener` lines a config may add. The server binds listen_port in
+ * slot 0 and the extra ports after it, all out of STRATUM_MAX_LISTENERS slots,
+ * so one fewer than that fits. The config used to accept all 8 and the server
+ * then dropped the last one without a word: a port the operator configured,
+ * advertised and firewalled, that nothing was listening on. */
+#define STRATUM_MAX_EXTRA_LISTENERS (STRATUM_MAX_LISTENERS - 1)
 
 typedef struct {
     char   bind_addr[64];
     int    bind_port;
     int    max_conns;            /* default 500 */
+
+    /* Ceiling on a miner-requested difficulty; <= 0 disables requests. */
+    double max_suggested_diff;
     double initial_diff;         /* default 1.0 */
+
+    /* Extra listeners beyond bind_port, each with its own difficulty policy.
+     * bind_port is always served, using the server-wide defaults, so a config
+     * that sets none of these behaves exactly as before. */
+    stratum_listener_t listeners[STRATUM_MAX_LISTENERS];
+    int    listener_count;
     /* Coinbase split — in solo mode each connection's coinbase pays the
-     * miner directly. In PPS mode (pps_enabled=1) every coinbase instead
-     * pays the single pool-owned pool_btc_address. In both modes
+     * miner directly. When the reward is pooled (coinbase_pays_pool=1) every
+     * coinbase instead pays the single pool-owned pool_btc_address. In both
      * (value * fee_bps / 10000) goes to operator_address as a BTC fee. */
     char   operator_address[128];
     int    fee_bps;
     char   coinbase_tag[64];
 
-    /* PPS (pool_mode=pps-classic). When pps_enabled = 1:
+    /* Pooled modes (pps-classic, pplns-*). When coinbase_pays_pool = 1:
      *  - mining.authorize accepts Thunder addresses (base58 of 20-byte hash)
      *  - the share observer's payout_address argument is the miner's
      *    Thunder address (for PPS accrual), not a Bitcoin address.
@@ -78,8 +208,52 @@ typedef struct {
      *    fee. Deposits into Thunder happen off-band via the admin
      *    dashboard, not in the coinbase.
      */
-    int     pps_enabled;
+    /* Two independent facts that pool_mode used to conflate under a single
+     * "is this PPS" flag. They are independent because pplns-btc is the mode
+     * that separates them: it pools the reward like PPS, so the coinbase pays
+     * the pool, while paying out over L1 like solo, so the username is a
+     * Bitcoin address.
+     *
+     *   mode           coinbase pays   username
+     *   solo           the miner       bitcoin
+     *   pps-classic    the pool        thunder
+     *   pplns-thunder  the pool        thunder
+     *   pplns-btc      the pool        bitcoin
+     */
+    int     coinbase_pays_pool;
+    int     username_is_thunder;
+
+    /* pplns-coinbase: the coinbase pays the WINDOW directly, one output per
+     * miner, so the pool never receives the reward at all. Mutually exclusive
+     * with coinbase_pays_pool — the reward goes to the miners or to the pool,
+     * never both — and distinct from solo, which pays only the finder.
+     *
+     * The window itself rides on the job (stratum_job_set_window), because it
+     * is a snapshot taken when the template was built. */
+    int     coinbase_pays_window;
+    size_t  max_coinbase_bytes;   /* 0 = COINBASE_DEFAULT_MAX_BYTES */
+    int64_t payout_floor_sats;    /* below this a claim is not paid this block */
+    window_fractions_fn on_window_fractions;  /* pplns-coinbase only */
+
+    /* Does this mode price a share when it arrives? Only pps-classic does.
+     * It is what the accrual gate suspends, so the gate must key on this and
+     * not on the gate pointer — main.c installs that pointer for every mode,
+     * and a mode with no per-share price has no accrual to suspend. Both
+     * PPLNS rails value a share only in hindsight, out of a block that was
+     * actually found, so there is nothing to misprice and nothing to gate. */
+    int     pps_accrues;
     char    pool_btc_address[128];   /* pps-classic: coinbase spendable output */
+
+    /* Points at the proxy's PPS accrual gate — non-zero while network
+     * difficulty is below the configured floor and nothing is being credited.
+     * NULL when the caller has no gate.
+     *
+     * The server reads it so it can turn miners away instead of accepting
+     * work it will not pay for. A miner whose shares are accepted but never
+     * credited is mining for free without being told, which is worse than
+     * being refused. */
+    const _Atomic int *pps_gate;
+    int     pps_refuse_shares_below_min;
 
     /* Vardiff (see config.h for prose). 0 disables and pins to initial_diff. */
     int    vardiff_enabled;
@@ -87,11 +261,69 @@ typedef struct {
     double vardiff_min;
     double vardiff_max;
     int    vardiff_window_sec;
+    /* See config.h: a window holding fewer than vardiff_min_samples shares is
+     * extended rather than acted on (up to vardiff_max_window_mult windows),
+     * and when it does end under-sampled its step is capped at
+     * vardiff_idle_step instead of the usual 4x. 0 samples disables both. */
+    int    vardiff_min_samples;
+    int    vardiff_max_window_mult;
+    double vardiff_idle_step;
 
     /* Drop a connection whose recv() has been silent for this long. Guards
      * against half-open TCPs from crashed miners and misconfigured clients
      * that connect but never authenticate. 0 disables (legacy). Default 600. */
     int    idle_timeout_sec;
+    /* The same, for a connection that has authorized — a working miner with
+     * nothing to say is not an idle one. 0 applies the 7200 default; negative
+     * never reaps an authorized miner. See config.h. */
+    int    idle_timeout_authorized_sec;
+
+    /* Ceiling on mining.submit per second, per connection. 0 disables.
+     *
+     * A connection's share rate is its hashrate divided by the difficulty it
+     * was assigned, and nothing stops those from being wildly mismatched: an
+     * aggregated fleet pointed at a home-miner port is 1 PH/s against
+     * difficulty 1, which is ~232,000 submits per second down one socket.
+     * Validating a submit costs about 9 microseconds, so that single
+     * connection asks for more than two cores -- and every share it lands
+     * goes through the store's ring, which drops events once full. Work the
+     * miner was told was accepted then never gets credited.
+     *
+     * The ceiling is deliberately far above anything a correctly configured
+     * miner reaches. With vardiff on, the steady state is vardiff_target_spm
+     * -- 0.2/s at the default -- for a connection of any size, because that
+     * is what vardiff converges on. The rates that approach this limit are
+     * transients while vardiff climbs, and they only get near it when the
+     * difficulty is already badly wrong.
+     *
+     * Over the limit the submit is refused with a stratum error before any
+     * hashing, so a flood costs a parse and a reply rather than a full
+     * validation. Refusing is also the honest answer: the miner learns its
+     * difficulty is wrong, where accepting the work and losing it in a full
+     * ring tells it everything is fine. */
+    int    max_submits_per_sec;
+
+    /* Budget for mining.authorize, in failures. 0 disables both halves.
+     *
+     * A failed authorize -- no worker name, a malformed username, an address
+     * that does not decode -- costs a reject observation and a log line, and
+     * nothing bounded how many of those one client could buy before it had
+     * authenticated at all. It is the cheapest write on the pool and it is
+     * open to anyone who can reach the port.
+     *
+     * Two limits from the one number. Per connection: the auth_max_failures-th
+     * failure is answered, then the connection is closed. Per peer address: an
+     * address that has failed auth_max_failures times within
+     * auth_fail_lockout_sec is refused at the TOP of the handler -- no
+     * decoding, no reject observation, no log line per attempt -- and the
+     * connection is closed, until the window passes. A successful authorize
+     * clears the address's record, so a miner that fixes its username is not
+     * made to wait.
+     *
+     * Ships on. Unlike max_submits_per_sec it refuses nothing a correct miner
+     * does: it only shortens how long a client may keep failing. */
+    int    auth_max_failures;
+    int    auth_fail_lockout_sec;
 
     void  *ctx;
     share_observer_fn  on_share;
@@ -103,8 +335,25 @@ typedef struct {
 typedef struct stratum_server stratum_server_t;
 
 int  stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out);
-/* Atomically swap the current job. Takes ownership of new_job. */
-void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job);
+/* Atomically swap the current job and notify every authorized connection.
+ * Takes ownership of new_job.
+ *
+ * clean_jobs is the flag sent in the mining.notify, and it is a instruction to
+ * the miner, not a description of the job: true means "throw away the work you
+ * are holding and restart". That is only true when the chain moved — a new
+ * tip makes every job in the miner's hands unmineable. It is emphatically not
+ * true of the periodic template refresh, which exists to pick up new
+ * transactions and a fresher ntime; the old job is still perfectly valid
+ * there, and the pool keeps accepting submits against it out of the recent
+ * ring either way.
+ *
+ * Sending clean_jobs=true on every refresh discards work in flight on every
+ * connected miner, several times per block. It costs the miner real hashrate,
+ * it is invisible to a probe that connects for a few seconds and reads one
+ * notify, and it is one of the behaviours rented-hashrate marketplaces
+ * delist pools for. Pass 1 only on a tip change. */
+void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
+                            int clean_jobs);
 void stratum_server_stop(stratum_server_t *s);
 void stratum_server_free(stratum_server_t *s);
 
@@ -119,19 +368,82 @@ typedef struct stratum_conn stratum_conn_t;
 /* Allocate a connection state attached to a server. Used by tests; the
  * real listener uses an internal allocator. */
 stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s);
+void stratum_conn_set_coinbase_budget_for_test(stratum_conn_t *c, int bytes);
 void            stratum_conn_free_for_test(stratum_conn_t *c);
 
 /* Test accessors — connection internals are otherwise opaque. */
+/* Rendered coinbase halves + extranonce1 for the current job, so tests can
+ * reproduce the hash a submit will produce and mine nonces to a chosen
+ * difficulty. Returns 0 on success. */
+int stratum_conn_coinbase_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                   const char *job_id,
+                                   const uint8_t **cb1, size_t *cb1_len,
+                                   const uint8_t **cb2, size_t *cb2_len,
+                                   const uint8_t **en1);
+double      stratum_conn_difficulty_for_test(const stratum_conn_t *c);
+/* Apply a listener's difficulty policy to a connection, exactly as the accept
+ * path does when a miner arrives on that port. Exposed so per-port policy can
+ * be tested without binding a fixed port, which in CI is a race with whatever
+ * else is on the box. */
+/* Set the peer address a test connection reports, so the per-address half of
+ * the authorize budget is reachable without a socket. */
+void        stratum_conn_set_peer_ip_for_test(stratum_conn_t *c, const char *ip);
+
+void        stratum_conn_apply_listener_for_test(stratum_conn_t *c,
+                                                 const stratum_listener_t *pol);
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);
 const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
+void stratum_conn_register_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                    int fd);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);
 int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
+/* Restart this connection's vardiff window, as handle_authorize does.
+ *
+ * handle_authorize arms the window, so any work a test does between the
+ * handshake and its first submit is spending window time. Brute-force mining
+ * in a test takes anywhere from a fraction of a second to several seconds
+ * under a sanitizer, so a test that mines before submitting can cross the
+ * window boundary on a loaded machine and spend a retarget it never intended
+ * -- which makes it pass or fail on timing rather than on behaviour. Call
+ * this after the setup work and before the submits that matter. */
+void        stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c);
+
+/* Put a test connection on the server's broadcast list with a real fd (one
+ * end of a socketpair), so a test can read exactly what
+ * stratum_server_set_job writes to a connected miner. Detach before freeing
+ * the connection. */
+void stratum_conn_attach_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                  int fd);
+void stratum_conn_detach_for_test(stratum_server_t *s, stratum_conn_t *c);
+
+/* Seconds of silence this connection is allowed before the reaper closes it.
+ * Differs by whether it has authorized; 0 means never reaped. */
+int stratum_conn_idle_budget_for_test(const stratum_server_t *s,
+                                      const stratum_conn_t *c);
 
 /* Apply the same socket options the listener applies to every accepted
  * connection: TCP_NODELAY, SO_KEEPALIVE + TCP_KEEP{IDLE,INTVL,CNT}, and
  * SO_RCVTIMEO (poll interval derived from idle_timeout_sec). Exposed for
  * tests. */
 int stratum_socket_setup_for_test(int fd, int idle_timeout_sec);
+
+/* Test-only: look a job up exactly as the submit path does, returning a
+ * COUNTED reference the caller must stratum_job_free(). Exists so a test can
+ * pin the property that makes the submit path safe — that a job stays valid
+ * for a holder even after the tip watcher has retired and freed it. */
+stratum_job_t *stratum_job_find_for_test(stratum_server_t *s, const char *job_id);
+uint32_t stratum_job_height_for_test(const stratum_job_t *j);
+/* Server-wide share dedupe, on a precomputed key rather than a header hash:
+ * 1 = already recorded, 0 = recorded now. Lets a test drive the index through
+ * eviction with keys it chooses. */
+int    stratum_share_dedupe_key_for_test(stratum_server_t *s, uint64_t key);
+/* Returns the ring's live count; *index_live gets the number of occupied
+ * index slots. The two must be equal -- that equality is the whole invariant
+ * of backward-shift deletion. */
+size_t stratum_share_dedupe_live_for_test(stratum_server_t *s,
+                                          size_t *index_live);
+
+int64_t  stratum_job_value_sats_for_test(const stratum_job_t *j);
 
 /* Process one JSON-RPC line. Appends one or more newline-delimited JSON
  * messages to *out_buf (caller-owned, will be realloc'd). Returns 0 on

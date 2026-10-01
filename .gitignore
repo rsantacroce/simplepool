@@ -3,6 +3,11 @@
 /.regtest/
 /.regtest-e2e/
 /.regtest-payout/
+/.regtest-pplns/
+/.regtest-btcpay/
+/.regtest-cbwin/
+/.regtest-solo/
+/.regtest-solo.lock/
 /proxy.conf
 /tests/integration.proxy.conf
 # The installer writes proxy.conf.bak.<timestamp> beside proxy.conf on every
@@ -17,3 +22,6 @@
 # and a `git add -A` sweeps them into a public repo.
 .DS_Store
 **/.DS_Store
+# graphify knowledge-graph output (graph.json, graph.html, report, cache).
+# Built locally per machine; not part of the project.
+/graphify-out/

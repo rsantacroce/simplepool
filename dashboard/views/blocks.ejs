@@ -11,11 +11,18 @@ const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-
 <%- include('partial/nav-public', { active: 'blocks' }) %>
 <main class="wrap">
         <section class="card">
-            <h2>Blocks found by the pool</h2>
+            <h2>Block candidates found by the pool</h2>
+            <p class="muted small">
+                Meeting the network target produces a <em>candidate</em>. The node
+                can refuse it, and the chain can reorg it out — only "in chain"
+                is a block the pool was actually paid for, and only those are
+                counted in the totals. The rest are kept here because a pool
+                whose candidates never land has a problem worth seeing.
+            </p>
             <% if (rows.length === 0) { %>
                 <p class="muted">No blocks recorded yet.</p>
             <% } else { %>
-            <table class="lb">
+            <div class="tablewrap"><table class="lb">
                 <thead>
                     <tr>
                         <th>When</th>
@@ -24,13 +31,14 @@ const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-
                         <th>Payout address</th>
                         <th>Reward</th>
                         <th>Operator fee</th>
+                        <th>Status</th>
                         <th>Hash</th>
                     </tr>
                 </thead>
                 <tbody>
                 <% rows.forEach(b => { %>
                     <tr>
-                        <td title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
+                        <td class="nowrap" title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
                         <td><%= fmtN(b.height) %></td>
                         <td>
                             <% if (b.finder) { %>
@@ -38,13 +46,14 @@ const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-
                             <% } else { %>—<% } %>
                         </td>
                         <td class="mono small" title="<%= b.finder_address || '' %>"><%= shortAddr(b.finder_address) %></td>
-                        <td><%= fmtBtc(b.reward_sats) %></td>
-                        <td><%= fmtBtc(b.fee_sats) %></td>
+                        <td class="nowrap"><%= b.status === 'confirmed' ? fmtBtc(b.reward_sats) : '—' %></td>
+                        <td class="nowrap"><%= b.status === 'confirmed' ? fmtBtc(b.fee_sats) : '—' %></td>
+                        <td class="nowrap"><%- blockStatus(b) %></td>
                         <td class="mono small" title="<%= b.hash %>"><%= shortHash(b.hash) %></td>
                     </tr>
                 <% }) %>
                 </tbody>
-            </table>
+            </table></div>
             <p class="muted small">
                 <% if (next_before) { %>
                     <a href="/blocks?before=<%= next_before %>">← older</a>
@@ -62,6 +71,5 @@ const shortAddr = (a) => a ? (a.length > 18 ? a.slice(0, 10) + '…' + a.slice(-
         <span class="sep">·</span>
         <a href="https://github.com/LayerTwo-Labs/simplepool" target="_blank" rel="noopener">source on GitHub</a>
     </footer>
-    <script src="/static/script.js" defer></script>
 </body>
 </html>

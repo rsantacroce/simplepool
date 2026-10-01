@@ -1,6 +1,14 @@
 // Stats queries against the simplepool SQLite schema.
 //
-// All hashrate estimates use:  H/s ≈ sum(difficulty) * 2^32 / windowSec
+// All hashrate estimates use:  H/s ≈ sum(difficulty) * 2^32 / elapsedSec
+//
+// elapsedSec is the time the shares actually span, NOT the nominal window.
+// Dividing a partial window by its full length reports a rate the miner never
+// ran at: a pool eleven hours old reads half its true rate against a 24h
+// window, and a rig that connected ten minutes ago reads 1/144th of its own.
+// Both correct themselves once the window fills, which is what makes it hard
+// to catch — the number is only wrong while a pool or a miner is new, which
+// is exactly when someone is most likely to be reading it.
 //
 // The handle passed in is the wrapper from lib/db.js — it may not yet be
 // connected (proxy hasn't started). In that case we return empty/zero
@@ -8,40 +16,75 @@
 
 const TWO_32 = 4294967296;
 
+/* Never divide by less than this. The span runs from the first share in the
+ * window to now, so a lone share a few seconds old would otherwise divide by
+ * ~0 and report an absurd spike. A minute is short enough to keep a new
+ * miner's reading honest and long enough to damp that. */
+const MIN_SPAN_SEC = 60;
+
+/* Seconds of real coverage inside `windowSec`, given the oldest share ts that
+ * falls within it. Never exceeds the nominal window — a share selected by
+ * `ts >= now - windowSec` cannot be older than that — and never drops below
+ * MIN_SPAN_SEC. With no shares at all it returns the nominal window, so an
+ * idle pool divides 0 by the full window and reports 0 H/s. */
+function spanFor(oldestTs, nowSec, windowSec) {
+    if (oldestTs == null) return windowSec;
+    const span = nowSec - oldestTs;
+    if (!Number.isFinite(span) || span <= 0) return MIN_SPAN_SEC;
+    return Math.min(windowSec, Math.max(span, MIN_SPAN_SEC));
+}
+
 const EMPTY_OVERVIEW = {
     accepted: 0,
     rejected: 0,
     blocks: 0,
+    blocks_pending: 0,
+    blocks_orphaned: 0,
+    blocks_rejected: 0,
     workers_active: 0,
     hashrate: 0,
     window_sec: 86400,
+    window_effective_sec: 86400,
     db_ready: false,
 };
+
+/* A row in blocks_found is a block CANDIDATE. Only status='confirmed' is a
+ * block the pool actually mined and can be paid for, so every count and every
+ * sum of reward_sats filters on it. Counting all of them is what made a pool
+ * that had mined nothing look like it had mined thousands of blocks.
+ *
+ * The other statuses are reported alongside rather than hidden: a pool whose
+ * candidates are nearly all orphaned has a real operational problem, and
+ * hiding the rows is what kept it invisible. */
+const CONFIRMED = "status = 'confirmed'";
 
 function db(handle) {
     return handle.get();
 }
 
-/* Hashrate over an arbitrary window. Uses the standard estimator
- * H/s ≈ sum(difficulty) * 2^32 / windowSec. */
+/* Hashrate over an arbitrary window, divided by the span the shares actually
+ * cover rather than the nominal window — see spanFor. */
 function hashrateOver(d, nowSec, windowSec) {
     const row = d.prepare(
-        'SELECT COALESCE(SUM(difficulty),0) AS sum_diff FROM shares WHERE ts >= ?'
+        'SELECT COALESCE(SUM(difficulty),0) AS sum_diff, MIN(ts) AS first_ts FROM shares WHERE ts >= ?'
     ).get(nowSec - windowSec);
-    return (row.sum_diff * TWO_32) / windowSec;
+    return (row.sum_diff * TWO_32) / spanFor(row.first_ts, nowSec, windowSec);
 }
 
 export function overview(handle, windowSec = 86400) {
     const d = db(handle);
-    if (!d) return { ...EMPTY_OVERVIEW, window_sec: windowSec };
+    if (!d) return { ...EMPTY_OVERVIEW, window_sec: windowSec, window_effective_sec: windowSec };
     const nowSec = Math.floor(Date.now() / 1000);
     const since = nowSec - windowSec;
 
     const acc = d.prepare(
-        'SELECT COUNT(*) AS n, COALESCE(SUM(difficulty),0) AS sum_diff, COALESCE(MAX(difficulty),0) AS best FROM shares WHERE ts >= ?'
+        'SELECT COUNT(*) AS n, COALESCE(SUM(difficulty),0) AS sum_diff, COALESCE(MAX(difficulty),0) AS best, MIN(ts) AS first_ts FROM shares WHERE ts >= ?'
     ).get(since);
+    const accSpan = spanFor(acc.first_ts, nowSec, windowSec);
     const rej = d.prepare('SELECT COUNT(*) AS n FROM rejects WHERE ts >= ?').get(since);
-    const blk = d.prepare('SELECT COUNT(*) AS n FROM blocks_found WHERE ts >= ?').get(since);
+    const blk = d.prepare(
+        `SELECT COUNT(*) AS n FROM blocks_found WHERE ts >= ? AND ${CONFIRMED}`
+    ).get(since);
     const wk = d.prepare(
         'SELECT COUNT(DISTINCT worker_id) AS n FROM shares WHERE ts >= ?'
     ).get(since);
@@ -50,7 +93,15 @@ export function overview(handle, windowSec = 86400) {
     ).get();
     const last = d.prepare('SELECT MAX(ts) AS ts FROM shares').get();
     const totalRej = d.prepare('SELECT COUNT(*) AS n FROM rejects').get();
-    const totalBlk = d.prepare('SELECT COUNT(*) AS n FROM blocks_found').get();
+    const totalBlk = d.prepare(
+        `SELECT COUNT(*) AS n FROM blocks_found WHERE ${CONFIRMED}`
+    ).get();
+    const candidates = d.prepare(`
+        SELECT COUNT(*) FILTER (WHERE status = 'pending')  AS pending,
+               COUNT(*) FILTER (WHERE status = 'orphaned') AS orphaned,
+               COUNT(*) FILTER (WHERE status = 'rejected') AS rejected
+          FROM blocks_found
+    `).get();
 
     const total24h = acc.n + rej.n;
     const rejectRate24h = total24h > 0 ? (rej.n / total24h) * 100 : 0;
@@ -59,8 +110,11 @@ export function overview(handle, windowSec = 86400) {
         accepted: acc.n,
         rejected: rej.n,
         blocks: blk.n,
+        blocks_pending:  Number(candidates?.pending  || 0),
+        blocks_orphaned: Number(candidates?.orphaned || 0),
+        blocks_rejected: Number(candidates?.rejected || 0),
         workers_active: wk.n,
-        hashrate: (acc.sum_diff * TWO_32) / windowSec,   // 24h estimate
+        hashrate: (acc.sum_diff * TWO_32) / accSpan,     // 24h estimate
         hashrate_1h: hashrateOver(d, nowSec, 3600),
         hashrate_5m: hashrateOver(d, nowSec, 300),
         best_share_24h: acc.best,
@@ -72,6 +126,7 @@ export function overview(handle, windowSec = 86400) {
         oldest_share_ts: lifetime.oldest_ts,
         last_share_ts: last.ts,
         window_sec: windowSec,
+        window_effective_sec: accSpan,
         db_ready: true,
     };
 }
@@ -91,6 +146,7 @@ export function leaderboard(handle, windowSec = 86400, limit = 50) {
                w.payout_address  AS payout_address,
                COUNT(s.id)       AS shares,
                MAX(s.ts)         AS last_seen,
+               MIN(s.ts)         AS first_ts,
                COALESCE(SUM(s.difficulty), 0) AS sum_diff
           FROM shares s
           JOIN workers w ON w.id = s.worker_id
@@ -101,21 +157,21 @@ export function leaderboard(handle, windowSec = 86400, limit = 50) {
     `).all(since, limit);
 
     const sumShort = d.prepare(
-        'SELECT COALESCE(SUM(difficulty),0) AS sd FROM shares WHERE worker_id = ? AND ts >= ?'
+        'SELECT COALESCE(SUM(difficulty),0) AS sd, MIN(ts) AS first_ts FROM shares WHERE worker_id = ? AND ts >= ?'
     );
 
     const totalDiff = rows.reduce((a, r) => a + r.sum_diff, 0);
     return rows.map(r => {
-        const sd1h = sumShort.get(r.id, since1h).sd;
-        const sd5m = sumShort.get(r.id, since5m).sd;
+        const r1h = sumShort.get(r.id, since1h);
+        const r5m = sumShort.get(r.id, since5m);
         return {
             name: r.name,
             payout_address: r.payout_address || null,
             shares: r.shares,
             last_seen: r.last_seen,
-            hashrate_est: (r.sum_diff * TWO_32) / windowSec,
-            hashrate_1h: (sd1h * TWO_32) / 3600,
-            hashrate_5m: (sd5m * TWO_32) / 300,
+            hashrate_est: (r.sum_diff * TWO_32) / spanFor(r.first_ts, nowSec, windowSec),
+            hashrate_1h: (r1h.sd * TWO_32) / spanFor(r1h.first_ts, nowSec, 3600),
+            hashrate_5m: (r5m.sd * TWO_32) / spanFor(r5m.first_ts, nowSec, 300),
             share_of_pool_pct: totalDiff > 0 ? (r.sum_diff / totalDiff) * 100 : 0,
         };
     });
@@ -128,7 +184,8 @@ export function leaderboard(handle, windowSec = 86400, limit = 50) {
 export function leaderboardByAddress(handle, windowSec = 86400, limit = 50) {
     const d = db(handle);
     if (!d) return [];
-    const since = Math.floor(Date.now() / 1000) - windowSec;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const since = nowSec - windowSec;
 
     // Aggregate shares per (payout_address). Workers with no payout_address
     // recorded (legacy rows) fall back to their `name` as the key so they
@@ -137,6 +194,7 @@ export function leaderboardByAddress(handle, windowSec = 86400, limit = 50) {
         SELECT COALESCE(NULLIF(w.payout_address, ''), w.name) AS addr,
                COUNT(s.id)                                    AS shares,
                MAX(s.ts)                                      AS last_seen,
+               MIN(s.ts)                                      AS first_ts,
                COALESCE(SUM(s.difficulty), 0)                 AS sum_diff,
                COUNT(DISTINCT w.id)                           AS rigs,
                GROUP_CONCAT(DISTINCT w.name)                  AS worker_names
@@ -162,7 +220,7 @@ export function leaderboardByAddress(handle, windowSec = 86400, limit = 50) {
             labels,
             shares: r.shares,
             last_seen: r.last_seen,
-            hashrate_est: (r.sum_diff * TWO_32) / windowSec,
+            hashrate_est: (r.sum_diff * TWO_32) / spanFor(r.first_ts, nowSec, windowSec),
             share_of_pool_pct: totalDiff > 0 ? (r.sum_diff / totalDiff) * 100 : 0,
         };
     });
@@ -175,7 +233,8 @@ export function worker(handle, name, windowSec = 86400) {
     const w = d.prepare('SELECT * FROM workers WHERE name = ?').get(name);
     if (!w) return { worker: null, shares: [], buckets: [] };
 
-    const since = Math.floor(Date.now() / 1000) - windowSec;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const since = nowSec - windowSec;
 
     const sharesRaw = d.prepare(`
         SELECT ts, difficulty, is_block, block_hash AS share_hash
@@ -186,9 +245,12 @@ export function worker(handle, name, windowSec = 86400) {
     `).all(w.id);
 
     // Compute the share's "actual difficulty": diff1_target / hash_value.
-    // diff1_target = 0x00000000_ffff0000_0000... (256-bit), so actual_diff
-    // approximates 2^32 / int(top 8 hex digits) for the leading non-zero
-    // 32 bits. Plenty good for ranking 'how lucky was each share'.
+    // diff1_target = 0x00000000_ffff0000_0000... (256-bit) — note it already
+    // carries 8 leading zero nibbles of its own. Writing the hash as
+    // v * 16^(56-i) for i leading zero nibbles and v the next 8 hex digits,
+    // and diff1_target as 0xffff0000 * 16^48, the ratio comes out as
+    // (0xffff0000 / v) * 16^(i-8). The -8 is diff1's own leading zeros;
+    // dropping it overstates every share by 16^8 = 2^32.
     const shares = sharesRaw.map(s => {
         let actual = null;
         if (s.share_hash && /^[0-9a-fA-F]+$/.test(s.share_hash)) {
@@ -200,8 +262,10 @@ export function worker(handle, name, windowSec = 86400) {
             const slice = h.slice(i, i + 8).padEnd(8, '0');
             const v = parseInt(slice, 16);
             if (v > 0) {
-                // Leading zeros add 16^(zeros) ≈ 4*zeros bits of difficulty.
-                const zeroFactor = Math.pow(16, i);
+                // Leading zeros beyond diff1's own eight are what make a
+                // share harder than difficulty 1; fewer than eight means a
+                // share easier than 1, so the exponent may go negative.
+                const zeroFactor = Math.pow(16, i - 8);
                 actual = (0xffff0000 / v) * zeroFactor;
             }
         }
@@ -210,7 +274,8 @@ export function worker(handle, name, windowSec = 86400) {
 
     const sumRow = d.prepare(`
         SELECT COALESCE(SUM(difficulty),0) AS sum_diff,
-               COUNT(*)                   AS n
+               COUNT(*)                   AS n,
+               MIN(ts)                    AS first_ts
           FROM shares
          WHERE worker_id = ? AND ts >= ?
     `).get(w.id, since);
@@ -255,8 +320,17 @@ export function worker(handle, name, windowSec = 86400) {
         SELECT accrued_sats, paid_sats, last_updated
           FROM pps_credits WHERE worker_id = ?
     `).get(w.id);
+    let pplnsAudit = null;
     if (credit) {
         const meta = poolMeta(d);
+        /* PPLNS prices a share in hindsight, out of a block actually found, so
+         * the per-share re-derivation below is structurally empty for it --
+         * every share carries credited_sats = 0. Give it the audit that
+         * matches how it was actually paid instead of one that reports the
+         * pool as owing nothing. */
+        const isPplns = meta && (meta.pool_mode === 'pplns-thunder' ||
+                                 meta.pool_mode === 'pplns-btc');
+        if (isPplns) pplnsAudit = pplnsAuditFor(d, w.id);
         const totals = d.prepare(`
             SELECT COUNT(*)                            AS share_count,
                    COALESCE(SUM(difficulty), 0)        AS sum_difficulty,
@@ -277,7 +351,14 @@ export function worker(handle, name, windowSec = 86400) {
             share_count:      Number(totals.share_count),
             sum_difficulty:   Number(totals.sum_difficulty),
             accrued_computed: Number(totals.accrued_computed),
-            matches:          Number(totals.accrued_computed) === accrued,
+            /* On PPLNS the per-share sum is meaningless rather than wrong, so
+             * it must not be presented as a mismatch: it said the pool was off
+             * by the miner's entire balance and told them to challenge the
+             * operator. pplns_audit carries the comparison that does hold. */
+            matches: pplnsAudit
+                ? pplnsAudit.credited_total === accrued
+                : Number(totals.accrued_computed) === accrued,
+            mode: meta ? meta.pool_mode : null,
         };
     }
 
@@ -299,7 +380,8 @@ export function worker(handle, name, windowSec = 86400) {
 
     /* Blocks found BY this worker specifically. */
     const workerBlocks = d.prepare(`
-        SELECT id, ts, height, hash, reward_sats, fee_sats
+        SELECT id, ts, height, hash, reward_sats, fee_sats,
+               status, confirmations, checked_via
         FROM   blocks_found
         WHERE  finder_id = ?
         ORDER  BY ts DESC, id DESC
@@ -308,6 +390,9 @@ export function worker(handle, name, windowSec = 86400) {
         id: r.id, ts: Number(r.ts), height: Number(r.height), hash: r.hash,
         reward_sats: Number(r.reward_sats || 0),
         fee_sats:    Number(r.fee_sats || 0),
+        status: r.status || 'pending',
+        confirmations: Number(r.confirmations || 0),
+        checked_via: r.checked_via || null,
     }));
 
     return {
@@ -317,12 +402,13 @@ export function worker(handle, name, windowSec = 86400) {
             first_seen: w.first_seen,
             last_seen: w.last_seen,
             window_shares: sumRow.n,
-            window_hashrate: (sumRow.sum_diff * TWO_32) / windowSec,
+            window_hashrate: (sumRow.sum_diff * TWO_32) / spanFor(sumRow.first_ts, nowSec, windowSec),
         },
         shares,
         buckets,
         window_sec: windowSec,
         pps_audit: ppsAudit,
+        pplns_audit: pplnsAudit,
         payouts,
         blocks: workerBlocks,
     };
@@ -337,6 +423,88 @@ export function worker(handle, name, windowSec = 86400) {
  *
  * Returns null on a DB predating pool_meta, in which case callers should
  * present the rate as unknown rather than substituting a guess. */
+/* The identity half of pool_meta: which chain the pool builds coinbases
+ * for, the tag it stamps into them, and where the money goes.
+ *
+ * Selected separately from the rate columns, and swallowing its own errors,
+ * because the two halves land in different releases: a dashboard upgraded
+ * ahead of the proxy reads a pool_meta that has no identity columns yet, and
+ * folding this into the main SELECT would turn that into a null poolMeta —
+ * losing the rate figures too, to add a banner.
+ *
+ * Everything is nullable on purpose. Rendering "unknown" is correct until
+ * the proxy has restarted and written the row; guessing a network is not. */
+function poolIdentity(d) {
+    const blank = {
+        network: null, network_source: null, coinbase_tag: null,
+        operator_address: null, pool_btc_address: null, listeners: null,
+        pplns_payout_floor_sats: null,
+    };
+    try {
+        const r = d.prepare(`
+            SELECT network, network_source, coinbase_tag,
+                   operator_address, pool_btc_address, listeners,
+                   pplns_payout_floor_sats
+              FROM pool_meta WHERE id = 1
+        `).get();
+        if (!r) return blank;
+        /* The proxy binds "" for an unset string; normalise to null so
+         * callers have one empty case to test rather than two. */
+        const or_ = v => (v === undefined || v === null || v === '') ? null : v;
+        return {
+            network:          or_(r.network),
+            network_source:   or_(r.network_source),
+            coinbase_tag:     or_(r.coinbase_tag),
+            operator_address: or_(r.operator_address),
+            pool_btc_address: or_(r.pool_btc_address),
+            listeners:        parseListeners(r.listeners),
+            /* NULL means "this mode has no payout floor", which is every mode
+             * but pplns-coinbase. Kept distinct from 0, which is a real floor
+             * meaning "pay anything the dust limit allows" -- so `?? null`
+             * rather than `|| null`, or a zero floor would read as no floor
+             * and the page would stop disclosing a policy that still applies. */
+            pplns_payout_floor_sats:
+                r.pplns_payout_floor_sats === undefined ||
+                r.pplns_payout_floor_sats === null
+                    ? null : Number(r.pplns_payout_floor_sats),
+        };
+    } catch {
+        return blank;   /* DB predating the identity columns */
+    }
+}
+
+/* The proxy publishes its stratum ports as a JSON array. Anything malformed
+ * reads as "not published" rather than taking the banner down — a pool that
+ * cannot describe its ports still has to serve its pages.
+ *
+ * Returns null when there is nothing trustworthy to show, never [] — the
+ * banner distinguishes "the proxy has not told us" from "there are no
+ * ports", and only the first is a state this pool can actually be in. */
+function parseListeners(raw) {
+    if (!raw) return null;
+    let arr;
+    try { arr = JSON.parse(raw); } catch { return null; }
+    if (!Array.isArray(arr)) return null;
+    const out = arr
+        .filter(l => l && Number.isFinite(Number(l.port)) && Number(l.port) > 0)
+        .map(l => ({
+            port:         Number(l.port),
+            label:        (typeof l.label === 'string' && l.label) ? l.label : null,
+            min_diff:     Number.isFinite(Number(l.min_diff))     ? Number(l.min_diff)     : null,
+            initial_diff: Number.isFinite(Number(l.initial_diff)) ? Number(l.initial_diff) : null,
+            /* Carried for the same reason health.js reads it: min_diff is the
+             * rate-loop bound, which the network difficulty still clamps,
+             * while promised_min_diff is KEPT when the chain is easier. Only
+             * the second one costs a miner blocks, so only the second one
+             * earns the warning the connect card prints. A proxy predating
+             * the field publishes nothing, which reads as 0 — no promise. */
+            promised_min_diff:
+                Number.isFinite(Number(l.promised_min_diff))
+                    ? Number(l.promised_min_diff) : 0,
+        }));
+    return out.length ? out : null;
+}
+
 export function poolMeta(handle) {
     /* Called from stats.js with a lazy handle and from admin.js with an
      * already-resolved better-sqlite3 Database, so accept either rather
@@ -355,6 +523,7 @@ export function poolMeta(handle) {
         const gross = Number(r.gross_sats_per_diff || 0);
         const rate  = Number(r.rate_sats_per_diff  || 0);
         return {
+            ...poolIdentity(d),
             pool_mode:           r.pool_mode || 'solo',
             fee_bps:             Number(r.fee_bps || 0),
             rate_source:         r.rate_source || 'derived',
@@ -368,11 +537,107 @@ export function poolMeta(handle) {
             /* An override whose implied fee has drifted from fee_bps is the
              * failure this table exists to expose. */
             fee_drift_bps: Number(r.effective_fee_bps || 0) - Number(r.fee_bps || 0),
-            accrues: (r.pool_mode || 'solo') === 'pps-classic',
+            /* Does a balance build up in pps_credits between payouts?
+             *
+             * True of PPS and of the two CUSTODIAL PPLNS rails -- they share
+             * the table and the payout worker that drains it. Solo and
+             * pplns-coinbase accrue nothing, because in both the coinbase
+             * itself is the payment and there is no balance to hold.
+             *
+             * It is deliberately not "is there a rate": PPS prices a share the
+             * moment it arrives, PPLNS values it in hindsight out of a block
+             * actually found, and only the former leaves rate_used on the row.
+             * rate_source and rate_sats_per_diff above are the PPS-only facts;
+             * this one is about whether the pool owes anyone anything. */
+            accrues: ['pps-classic', 'pplns-thunder', 'pplns-btc']
+                        .includes(r.pool_mode || 'solo'),
         };
     } catch {
         return null;   /* pre-pool_meta DB */
     }
+}
+
+/* The PPLNS answer to "why is this number what it is?".
+ *
+ * PPS credits a share when it arrives, so its audit re-derives from
+ * shares.credited_sats. PPLNS credits nothing on arrival -- every share has
+ * credited_sats = 0 and rate_used = 0 -- so that re-derivation returns zero
+ * against a real balance and the page reported the pool as off by the
+ * miner's whole balance, telling them to go and challenge the operator. On
+ * the one page whose entire purpose is being checkable.
+ *
+ * The honest re-derivation is the one the distributor actually performed:
+ * for each block that has matured and been distributed, walk back from that
+ * block's own share until the window fills, and take this worker's share of
+ * the difficulty in it. Reproduced here from the raw shares and blocks_found
+ * rows, with no reference to anything the payout path wrote, so a miner can
+ * check the pool's arithmetic rather than take delivery of it.
+ *
+ * The window SQL mirrors store_pplns_distribute() exactly, including the
+ * comparison against the running total EXCLUDING the current row, which is
+ * what includes the share that crosses the boundary whole rather than
+ * splitting it.
+ *
+ * ⚠ ONE ASSUMPTION, and it is stated in the UI rather than hidden: fee_bps is
+ * read from pool_meta as it stands NOW. The distributor used whatever it was
+ * when the block matured, and nothing records the value per block. An
+ * operator who has changed the fee will see older blocks fail to reproduce.
+ * That is a real limit of the stored data, not a discrepancy in the ledger,
+ * and saying so beats either hiding it or crying wolf. */
+export function pplnsAuditFor(d, workerId, limit = 50) {
+    const meta = d.prepare('SELECT fee_bps FROM pool_meta WHERE id = 1').get();
+    const feeBps = Number(meta?.fee_bps || 0);
+
+    const blocks = d.prepare(`
+        SELECT id, height, hash, ts,
+               COALESCE(reward_sats, 0) + COALESCE(fee_sats, 0) AS gross,
+               pplns_window_diff AS window_diff
+          FROM blocks_found
+         WHERE pplns_distributed = 1 AND pplns_window_diff > 0
+         ORDER BY height DESC
+         LIMIT ?
+    `).all(limit);
+
+    /* One block's window, split between this worker and everyone else. */
+    const split = d.prepare(`
+        WITH anchored AS (
+          SELECT id, worker_id, difficulty,
+                 SUM(difficulty) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING) AS running
+            FROM shares
+           WHERE id <= (SELECT MAX(id) FROM shares WHERE block_hash = ?)
+        )
+        SELECT COALESCE(SUM(CASE WHEN worker_id = ? THEN difficulty END), 0) AS mine,
+               COALESCE(SUM(difficulty), 0)                                  AS total
+          FROM anchored
+         WHERE running - difficulty < ?
+    `);
+
+    const rows = [];
+    let credited_total = 0;
+    for (const b of blocks) {
+        const gross = Number(b.gross);
+        /* Same truncating integer arithmetic as the distributor. */
+        const payable = feeBps > 0 && feeBps <= 10000
+            ? gross - Math.floor((gross * feeBps) / 10000)
+            : gross;
+        const { mine, total } = split.get(b.hash, workerId, b.window_diff);
+        const my_diff = Number(mine), win_diff = Number(total);
+        /* Truncating, exactly as the C does: the sum of everyone's credits can
+         * fall a few sats short of payable, never over it. */
+        const credited = (win_diff > 0 && my_diff > 0)
+            ? Math.trunc(payable * (my_diff / win_diff))
+            : 0;
+        credited_total += credited;
+        rows.push({
+            height: Number(b.height), hash: b.hash, ts: Number(b.ts),
+            gross, payable, window_diff: Number(b.window_diff),
+            my_diff, win_diff,
+            share_pct: win_diff > 0 ? (my_diff / win_diff) * 100 : 0,
+            credited,
+        });
+    }
+    return { fee_bps: feeBps, blocks: rows, credited_total,
+             block_count: rows.length, truncated: blocks.length === limit };
 }
 
 /* Independently re-derive the PPS ledger instead of reporting it.
@@ -561,7 +826,40 @@ export function nodeStatus(handle) {
         updated_at: row.updated_at,
         seconds_since_tip:    row.tip_observed_at ? nowSec - row.tip_observed_at : null,
         seconds_since_update: row.updated_at      ? nowSec - row.updated_at      : null,
+        ...networkDifficulty(d),
     };
+}
+
+/* The chain's current difficulty, for the node-tip card and /api/node.
+ *
+ * It is NOT in node_status: that table is the bitcoind tip poll, and nothing
+ * in it carries a target. The number comes from pool_meta, which the proxy
+ * rewrites from every block template it builds a job from (refresh_pps_rate
+ * in main.c derives it from the template's target/bits) — the same row the
+ * PPS rate and the health checks already read, so there is one difficulty on
+ * this dashboard rather than two that can disagree.
+ *
+ * Its own timestamp comes with it, separately from node_status.updated_at:
+ * the tip poll and the template feed are different sources and can go stale
+ * independently, so a difficulty frozen at yesterday's value next to a
+ * ticking tip height has to be visible as such rather than read as current.
+ *
+ * Returns {} — not nulls — on a DB that predates pool_meta, so the caller
+ * spreads nothing and the field is simply absent. */
+function networkDifficulty(d) {
+    try {
+        const r = d.prepare(
+            'SELECT network_difficulty, updated_at FROM pool_meta WHERE id = 1'
+        ).get();
+        const n = Number(r && r.network_difficulty);
+        if (!isFinite(n) || n <= 0) return {};
+        return {
+            network_difficulty: n,
+            network_difficulty_at: Number(r.updated_at || 0) || null,
+        };
+    } catch {
+        return {};   /* pre-pool_meta DB */
+    }
 }
 
 export function recentBlocks(handle, limit = 25) {
@@ -574,6 +872,9 @@ export function recentBlocks(handle, limit = 25) {
                b.finder_address,
                b.reward_sats,
                b.fee_sats,
+               b.status,
+               b.confirmations,
+               b.checked_via,
                w.name AS finder
           FROM blocks_found b
           LEFT JOIN workers w ON w.id = b.finder_id
@@ -592,7 +893,8 @@ export function allBlocks(handle, { limit = 50, beforeTs = null } = {}) {
     if (beforeTs == null) {
         rows = d.prepare(`
             SELECT b.ts, b.height, b.hash, b.finder_address,
-                   b.reward_sats, b.fee_sats, w.name AS finder
+                   b.reward_sats, b.fee_sats, b.status, b.confirmations,
+                   b.checked_via, w.name AS finder
               FROM blocks_found b
               LEFT JOIN workers w ON w.id = b.finder_id
              ORDER BY b.ts DESC
@@ -601,7 +903,8 @@ export function allBlocks(handle, { limit = 50, beforeTs = null } = {}) {
     } else {
         rows = d.prepare(`
             SELECT b.ts, b.height, b.hash, b.finder_address,
-                   b.reward_sats, b.fee_sats, w.name AS finder
+                   b.reward_sats, b.fee_sats, b.status, b.confirmations,
+                   b.checked_via, w.name AS finder
               FROM blocks_found b
               LEFT JOIN workers w ON w.id = b.finder_id
              WHERE b.ts < ?

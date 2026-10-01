@@ -3,12 +3,34 @@
 
 #include <stddef.h>
 
+#include "stratum.h"   /* stratum_listener_t, STRATUM_MAX_LISTENERS */
+
 typedef struct {
     /* listener */
     char listen_addr[64];
     int  listen_port;
     int  max_conns;
+    /* Still 1: the difficulty policy lives on the listener now, so a config
+     * naming no listeners behaves exactly as it always did. A rental port
+     * sets its own via `listener = port=3335 min_diff=65536`. */
     double initial_diff;
+
+    /* Extra stratum ports beyond listen_port, each with its own difficulty
+     * policy — see `listener` in proxy.conf.example. The point is serving a
+     * home ASIC and a rented fleet from the same pool without either one
+     * getting the other's difficulty. */
+    stratum_listener_t listeners[STRATUM_MAX_LISTENERS];
+    int  listener_count;
+
+    /* Per-connection ceiling on mining.submit per second. 0 disables.
+     * See stratum.h for why it sits where it does. */
+    int  max_submits_per_sec;
+
+    /* Budget for mining.authorize: failures allowed per connection and per
+     * peer address, and how long an address stays refused once it is spent.
+     * 0 failures disables both. See stratum.h. */
+    int  auth_max_failures;
+    int  auth_fail_lockout_sec;
 
     /* vardiff — auto-adjust each connection's difficulty to keep the
      * share rate near `target_spm` shares/minute. Set vardiff_enabled = 0
@@ -17,13 +39,70 @@ typedef struct {
     double vardiff_target_spm;    /* default 12 shares/min (one every 5s) */
     double vardiff_min;           /* default 1.0 */
     double vardiff_max;           /* default 1e12; clamped by network diff */
+
+    /* Ceiling on a miner-requested difficulty (stratum password `d=<n>` or
+     * mining.suggest_difficulty). Default 50000000.
+     *
+     * ⚠️ Size this against idle_timeout_authorized_sec, not against taste. A
+     * request is a FLOOR on the connection's difficulty, so it directly
+     * lengthens that connection's expected share interval — and the reaper
+     * measures inbound silence. At 50M a 25 TH/s connection expects a share
+     * roughly every 8600s, which is past the 7200s default: it would be reaped
+     * while mining perfectly well. Raise one or lower the other.
+     *
+     * <= 0 DISABLES requests rather than uncapping them. That is deliberate:
+     * "no ceiling" is not a sane reading of a limit set to zero, and an
+     * operator who wants the feature off needs a way to say so. */
+    double max_suggested_diff;    /* default 5e7; <= 0 disables requests */
     int    vardiff_window_sec;    /* retarget interval, default 30 */
+
+    /* Minimum accepted shares a window must hold before its rate is trusted
+     * enough to retarget on. Default 20.
+     *
+     * At the default target_spm = 12 over a 30 s window an ON-TARGET
+     * connection produces SIX shares, and Poisson noise on six samples is
+     * +/-41% (1/sqrt(6)). The ratio therefore lands outside the [0.5, 2.0]
+     * deadband routinely even when the difficulty is already correct, so the
+     * controller oscillates instead of converging. Below this floor the
+     * window is EXTENDED rather than acted on -- up to
+     * vardiff_max_window_mult times the nominal window, after which we act on
+     * what we have so a genuinely over-difficult connection still ratchets
+     * down. 0 restores the previous behaviour exactly. */
+    int    vardiff_min_samples;      /* default 20 */
+
+    /* How far a window may be extended, as a multiple of vardiff_window_sec,
+     * while waiting for vardiff_min_samples. Default 8. */
+    int    vardiff_max_window_mult;  /* default 8 */
+
+    /* Max step for a window that did NOT meet vardiff_min_samples. A window
+     * that met it keeps the historical 4x. Default 2.
+     *
+     * This is what stops a quiet connection being driven to the floor: a
+     * proxied fleet spreads one rig over many connections, each going quiet
+     * between bursts, and at 4x a pair of near-empty windows cuts difficulty
+     * 16x -- which the miner's own firmware then reports back as "difficulty
+     * too low". */
+    double vardiff_idle_step;        /* default 2.0 */
 
     /* Idle-connection reaper. A connection that hasn't sent any bytes in
      * idle_timeout_sec is closed. Guards against half-open TCPs from
      * crashed miners and clients that connect but never authenticate.
      * Set to a negative value to disable entirely; 0 uses the default. */
     int    idle_timeout_sec;      /* default 600 (10 min) */
+
+    /* The same reaper, but for a connection that has authorized. It is a
+     * separate (much longer) budget because the two cases are not the same
+     * risk: an unauthorized socket is a squatter and costs an fd for nothing,
+     * whereas an authorized miner that has sent nothing is usually just a
+     * small rig that has not found a share at its assigned difficulty yet.
+     * The pool never solicits anything from a miner, so a healthy ASIC has no
+     * reason to speak between shares — reaping it at 10 minutes disconnects
+     * working hashrate, which is exactly the behaviour marketplaces blacklist
+     * pools for. TCP keepalive (2 min idle + 3x30s probes) already reaps a
+     * genuinely dead socket in ~3.5 min, so this only needs to catch a peer
+     * that is answering keepalives while doing no work.
+     * Negative disables; 0 uses the default. */
+    int    idle_timeout_authorized_sec;  /* default 7200 (2 h) */
 
     /* bitcoind */
     char bitcoind_url[512];
@@ -54,8 +133,56 @@ typedef struct {
      * operator later batches that BTC into Thunder via the admin
      * dashboard's deposit action, and the payout worker drains the Thunder
      * reserve to miners. */
-    char pool_mode[16];                       /* "solo" | "pps-classic" */
-    /* pps-classic: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH) for
+    /* "solo" | "pps-classic" | "pplns-thunder" | "pplns-btc"
+     *
+     * The two pplns values are one knob rather than a mode plus a rail knob
+     * because an operator runs one or the other: a pool cannot pay some
+     * miners over Thunder and others on L1 from the same window, since the
+     * rail decides what a username even is. Encoding it as a single value
+     * makes the inconsistent configuration unrepresentable instead of
+     * merely rejected. */
+    char pool_mode[24];
+    /* PPLNS window size, as a multiple of the CURRENT network difficulty.
+     * 2.0 means "the last two blocks' worth of expected work".
+     *
+     * A multiple rather than an absolute figure because it self-scales
+     * across retargets. An absolute share count or difficulty sum silently
+     * changes meaning every time the chain retargets — on a forknet moving
+     * 4x that turns the window into something four times longer or shorter
+     * than the operator chose, without anything in the config changing. */
+    double pplns_window_diff_multiple;        /* default 2.0 */
+    /* pplns-coinbase: the whole serialized coinbase's byte budget, which is
+     * what actually limits how many miners a block can pay.
+     *
+     * Not a consensus limit. A rented-hashrate marketplace verifies the
+     * coinbase and refuses a job whose coinbase it considers oversized, and
+     * the number that matters therefore belongs to whichever marketplace an
+     * operator sells to. A coinbase-direct pool in production reports whole
+     * coinbases of 721-817 bytes paying up to 16 miners; the default leaves
+     * headroom on that. 0 = COINBASE_DEFAULT_MAX_BYTES. */
+    int coinbase_max_bytes;                  /* default 1000 */
+
+    /* pplns-coinbase: a claim worth less than this is not paid BY THIS BLOCK.
+     * Its value goes to the other miners in the same window -- not to the
+     * operator, which receives its fee and nothing else -- and the worker is
+     * recorded as owed a slot in the payout queue, so a later block whose
+     * coinbase has room reaches it first. See pplns_fractions in schema.sql.
+     *
+     * This comment said the opposite until the mode was measured: the value
+     * was forfeited to the operator and nothing was carried. That rule paid
+     * the operator MORE the tighter the coinbase (46%% of the block at a
+     * 400-byte budget against 2%% at 3000) and excluded the same miners every
+     * block, because a miner's window share tracks its hashrate. See the long
+     * note at the redistribution in coinbase.c
+     * (LayerTwo-Labs/simplepool#76).
+     *
+     * Deliberate policy, not a rounding artefact: coinbase-direct pays out of
+     * the block itself, so every extra output is bytes an operator may not
+     * have. Clamped up to COINBASE_DUST_SATS (546); below that no output is
+     * relayable anyway. */
+    int64_t pplns_payout_floor_sats;         /* default 546 (dust) */
+
+    /* pooled modes: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH) for
      * the net-of-fee reward. Required when pool_mode = pps-classic;
      * ignored otherwise. */
     char pool_btc_address[128];
@@ -74,6 +201,45 @@ typedef struct {
      * A static value silently drifts as difficulty moves, and can invert
      * into paying miners more than the pool earns, so prefer derived. */
     double pps_sats_per_diff;
+
+    /* Minimum network difficulty at which PPS accrual is allowed to run.
+     *
+     * The PPS rate is block_value / network_difficulty, which is the expected
+     * value of a share — correct only while every share the pool produces has
+     * an independent chance of becoming a block. That holds when difficulty is
+     * calibrated to hashrate. It stops holding when the pool produces
+     * solutions faster than the chain accepts blocks, and then the rate is
+     * overstated by exactly that ratio.
+     *
+     * The threshold is the difficulty at which this pool ALONE would find one
+     * block per block interval:
+     *
+     *     min_difficulty = pool_hashrate * block_interval_sec / 2^32
+     *
+     * A 40 TH/s pool on a 600s chain needs difficulty >= ~5,600,000. Below it,
+     * accrual is refused. That is a floor, not a target: the pool shares the
+     * chain with other miners, so the genuinely safe difficulty is higher.
+     *
+     * 0 disables the check, which is only safe on a chain whose difficulty is
+     * already calibrated — mainnet, testnet, signet. On a young forknet during
+     * its difficulty ramp, leaving this at 0 is how a pool accrues millions of
+     * BTC of liability in minutes. The proxy logs the value it observes to be
+     * necessary, so a wrong setting is visible rather than silent. */
+    double pps_min_network_difficulty;
+
+    /* Target seconds between blocks on this chain — 600 for Bitcoin and every
+     * chain derived from it. Used for the difficulty floor above and for the
+     * issuance ceiling, which caps accrual at what the chain can actually mint
+     * (one block_value per interval, across all miners on earth). */
+    int block_interval_sec;
+
+    /* Refuse mining.authorize while accrual is gated off by the floor.
+     *
+     * Default on, and deliberately so: a miner whose shares are accepted but
+     * not credited is working for free without being told. Turning it off
+     * accepts shares that earn nothing, which is only reasonable if the miners
+     * are yours and you know why. */
+    int pps_refuse_shares_below_min;
 
     /* logging */
     int  log_level;            /* 0..3 */

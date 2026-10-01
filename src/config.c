@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "config.h"
+#include "coinbase.h"
 #include "log.h"
 
 #include <ctype.h>
@@ -23,7 +24,17 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     snprintf(cfg->listen_addr, sizeof cfg->listen_addr, "%s", "0.0.0.0");
     cfg->listen_port  = 3334;
     cfg->max_conns    = 500;
+    /* Still 1, and deliberately: the port carries the difficulty policy now,
+     * so a config that names no listeners binds precisely what it always did.
+     * A marketplace-grade starting difficulty belongs on a rental listener
+     * (`listener = port=3335 min_diff=65536`), not on the port home miners
+     * are already pointed at. */
     cfg->initial_diff = 1.0;
+    /* Far above any correctly configured miner and far below what one
+     * mismatched connection can otherwise cost. See proxy.conf.example. */
+    cfg->max_submits_per_sec = 20000;
+    cfg->auth_max_failures     = 3;
+    cfg->auth_fail_lockout_sec = 60;
 
     snprintf(cfg->bitcoind_url,  sizeof cfg->bitcoind_url,  "%s", "http://127.0.0.1:18443");
     /* No default credentials: when bitcoind_user/bitcoind_pass are omitted the
@@ -48,16 +59,27 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_target_spm = 12.0;   /* ~1 share every 5s per connection */
     cfg->vardiff_min        = 1.0;
     cfg->vardiff_max        = 1e12;
+    cfg->max_suggested_diff = 5e7;
     cfg->vardiff_window_sec = 30;
+    cfg->vardiff_min_samples     = 20;
+    cfg->vardiff_max_window_mult = 8;
+    cfg->vardiff_idle_step       = 2.0;
     cfg->idle_timeout_sec   = 600;    /* 10 min silent recv → reap */
+    cfg->idle_timeout_authorized_sec = 7200;  /* 2 h once a miner is working */
 
     cfg->redis_url[0] = '\0';
     cfg->redis_publish_timeout_ms   = 200;
     cfg->redis_reconnect_backoff_ms = 2000;
 
     snprintf(cfg->pool_mode, sizeof cfg->pool_mode, "%s", "solo");
+    cfg->pplns_window_diff_multiple = 2.0;
+    cfg->coinbase_max_bytes = 1000;
+    cfg->pplns_payout_floor_sats = COINBASE_DUST_SATS;
     cfg->pool_btc_address[0] = '\0';
     cfg->pps_sats_per_diff = 0.0;
+    cfg->pps_min_network_difficulty = 0.0;
+    cfg->block_interval_sec = 600;
+    cfg->pps_refuse_shares_below_min = 1;
 }
 
 static char *strtrim(char *s) {
@@ -66,6 +88,27 @@ static char *strtrim(char *s) {
     char *e = s + strlen(s) - 1;
     while (e > s && isspace((unsigned char)*e)) { *e = '\0'; e--; }
     return s;
+}
+
+/* Truncate the line at a comment introducer.
+ *
+ * `#` only starts a comment at the start of the line or after whitespace, and
+ * never inside double quotes. The old rule was "the first # anywhere", applied
+ * before the key/value split and before unquote() — so a password of p#ssw0rd
+ * silently became p, quoting did not help, and the pool then failed RPC auth
+ * with nothing in the log to say why. coinbase_tag and the address fields had
+ * the same exposure. Inline comments (` # like this`) still work, which is
+ * what proxy.conf.example documents. */
+static void strip_comment(char *line) {
+    int in_quotes = 0;
+    for (char *p = line; *p; ++p) {
+        if (*p == '"') { in_quotes = !in_quotes; continue; }
+        if (*p == '#' && !in_quotes &&
+            (p == line || p[-1] == ' ' || p[-1] == '\t')) {
+            *p = '\0';
+            return;
+        }
+    }
 }
 
 static void unquote(char *s) {
@@ -88,6 +131,86 @@ static int parse_log_level(const char *v) {
     return -1;
 }
 
+static void copy_str(char *dst, size_t cap, const char *src);
+
+/* Parse one `listener = port=3335 min_diff=65536 label=braiins` line into
+ * `out`. Fields are separated by whitespace or commas and may appear in any
+ * order; `port` is the only required one, and anything left unset falls back
+ * to the server-wide default at accept time.
+ *
+ * min_diff sets the vardiff floor and, unless initial_diff says otherwise,
+ * the starting difficulty too. That pairing is the whole point of a rental
+ * port: the miner has to arrive already at the floor, because vardiff cannot
+ * climb to it fast enough to matter. Returns 0 on success. */
+static int parse_listener(const char *v, stratum_listener_t *out,
+                          char *errbuf, size_t errlen) {
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", v);
+    memset(out, 0, sizeof *out);
+
+    double min_diff = 0.0, initial = 0.0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " \t,", &save); tok;
+         tok = strtok_r(NULL, " \t,", &save)) {
+        char *eq = strchr(tok, '=');
+        if (!eq) {
+            set_err(errbuf, errlen, "listener field '%s' is not key=value", tok);
+            return -1;
+        }
+        *eq = '\0';
+        const char *fk = tok, *fv = eq + 1;
+        if      (strcmp(fk, "port")         == 0) out->port = atoi(fv);
+        else if (strcmp(fk, "min_diff")     == 0) min_diff = atof(fv);
+        else if (strcmp(fk, "initial_diff") == 0) initial = atof(fv);
+        else if (strcmp(fk, "max_diff")     == 0) out->vardiff_max = atof(fv);
+        else if (strcmp(fk, "max_coinbase_bytes") == 0) out->max_coinbase_bytes = atoi(fv);
+        else if (strcmp(fk, "label")        == 0) copy_str(out->label, sizeof out->label, fv);
+        else {
+            set_err(errbuf, errlen, "unknown listener field '%s'", fk);
+            return -1;
+        }
+    }
+    /* Same floor as the server-wide setting: below this no coinbase can hold
+     * even one payout, so the port could not pay anybody at all. 0 means "use
+     * the server-wide one" and is always fine. */
+    if (out->max_coinbase_bytes != 0 && out->max_coinbase_bytes < 200) {
+        set_err(errbuf, errlen,
+                "listener max_coinbase_bytes = %d is too small to hold a "
+                "coinbase and a single payout; omit it to use the server-wide "
+                "coinbase_max_bytes", out->max_coinbase_bytes);
+        return -1;
+    }
+    if (out->port <= 0 || out->port > 65535) {
+        set_err(errbuf, errlen, "listener needs a port between 1 and 65535");
+        return -1;
+    }
+    /* The label is published to the DB inside a JSON blob and rendered into
+     * the dashboard. Constraining it here means neither of those has to
+     * escape it, and an operator typo fails at startup rather than producing
+     * a banner that silently breaks. */
+    for (const char *q = out->label; *q; ++q) {
+        if (!isalnum((unsigned char)*q) && *q != '-' && *q != '_') {
+            set_err(errbuf, errlen,
+                    "listener port %d: label may only contain letters, "
+                    "digits, '-' and '_'", out->port);
+            return -1;
+        }
+    }
+    out->vardiff_min  = min_diff;
+    /* Recorded separately from vardiff_min so the server can tell "this port
+     * promised a floor" from "this port inherited the server-wide rate-loop
+     * bound". Only the former survives the network-difficulty ceiling. */
+    out->min_diff     = min_diff;
+    out->initial_diff = initial > 0.0 ? initial : min_diff;
+    if (out->vardiff_max > 0.0 && out->initial_diff > out->vardiff_max) {
+        set_err(errbuf, errlen,
+                "listener port %d: initial difficulty %g is above max_diff %g",
+                out->port, out->initial_diff, out->vardiff_max);
+        return -1;
+    }
+    return 0;
+}
+
 static void copy_str(char *dst, size_t cap, const char *src) {
     snprintf(dst, cap, "%s", src);
 }
@@ -106,9 +229,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
     int lineno = 0;
     while (fgets(line, sizeof line, f)) {
         lineno++;
-        /* Strip comment. */
-        char *hash = strchr(line, '#');
-        if (hash) *hash = '\0';
+        strip_comment(line);
 
         char *trimmed = strtrim(line);
         if (*trimmed == '\0') continue;
@@ -126,7 +247,30 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         if      (strcmp(k, "listen_addr")               == 0) copy_str(cfg->listen_addr, sizeof cfg->listen_addr, v);
         else if (strcmp(k, "listen_port")               == 0) cfg->listen_port = atoi(v);
         else if (strcmp(k, "max_conns")                 == 0) cfg->max_conns = atoi(v);
+        else if (strcmp(k, "max_submits_per_sec")       == 0) cfg->max_submits_per_sec = atoi(v);
+        else if (strcmp(k, "auth_max_failures")        == 0) cfg->auth_max_failures = atoi(v);
+        else if (strcmp(k, "auth_fail_lockout_sec")    == 0) cfg->auth_fail_lockout_sec = atoi(v);
         else if (strcmp(k, "initial_diff")              == 0) cfg->initial_diff = atof(v);
+        else if (strcmp(k, "listener")                  == 0) {
+            /* Repeatable, unlike every other key here: each one adds a port
+             * rather than replacing the last. */
+            if (cfg->listener_count >= STRATUM_MAX_EXTRA_LISTENERS) {
+                set_err(errbuf, errlen,
+                        "config: line %d: at most %d listener lines "
+                        "(listen_port takes the remaining slot)",
+                        lineno, STRATUM_MAX_EXTRA_LISTENERS);
+                fclose(f);
+                return -1;
+            }
+            stratum_listener_t l;
+            char lerr[256] = {0};
+            if (parse_listener(v, &l, lerr, sizeof lerr) != 0) {
+                set_err(errbuf, errlen, "config: line %d: %s", lineno, lerr);
+                fclose(f);
+                return -1;
+            }
+            cfg->listeners[cfg->listener_count++] = l;
+        }
         else if (strcmp(k, "bitcoind_url")              == 0) copy_str(cfg->bitcoind_url, sizeof cfg->bitcoind_url, v);
         else if (strcmp(k, "bitcoind_user")             == 0) copy_str(cfg->bitcoind_user, sizeof cfg->bitcoind_user, v);
         else if (strcmp(k, "bitcoind_pass")             == 0) copy_str(cfg->bitcoind_pass, sizeof cfg->bitcoind_pass, v);
@@ -147,8 +291,13 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_target_spm")        == 0) cfg->vardiff_target_spm = atof(v);
         else if (strcmp(k, "vardiff_min")               == 0) cfg->vardiff_min = atof(v);
         else if (strcmp(k, "vardiff_max")               == 0) cfg->vardiff_max = atof(v);
+        else if (strcmp(k, "max_suggested_diff")     == 0) cfg->max_suggested_diff = atof(v);
         else if (strcmp(k, "vardiff_window_sec")        == 0) cfg->vardiff_window_sec = atoi(v);
+        else if (strcmp(k, "vardiff_min_samples")      == 0) cfg->vardiff_min_samples = atoi(v);
+        else if (strcmp(k, "vardiff_max_window_mult")  == 0) cfg->vardiff_max_window_mult = atoi(v);
+        else if (strcmp(k, "vardiff_idle_step")        == 0) cfg->vardiff_idle_step = atof(v);
         else if (strcmp(k, "idle_timeout_sec")          == 0) cfg->idle_timeout_sec = atoi(v);
+        else if (strcmp(k, "idle_timeout_authorized_sec") == 0) cfg->idle_timeout_authorized_sec = atoi(v);
         else if (strcmp(k, "db_path")                   == 0) copy_str(cfg->db_path, sizeof cfg->db_path, v);
         else if (strcmp(k, "commit_window_ms")          == 0) cfg->commit_window_ms = atoi(v);
         else if (strcmp(k, "commit_max_shares")         == 0) cfg->commit_max_shares = atoi(v);
@@ -158,7 +307,13 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "redis_reconnect_backoff_ms")== 0) cfg->redis_reconnect_backoff_ms = atoi(v);
         else if (strcmp(k, "pool_mode")                 == 0) copy_str(cfg->pool_mode, sizeof cfg->pool_mode, v);
         else if (strcmp(k, "pool_btc_address")          == 0) copy_str(cfg->pool_btc_address, sizeof cfg->pool_btc_address, v);
+        else if (strcmp(k, "pplns_window_diff_multiple") == 0) cfg->pplns_window_diff_multiple = atof(v);
+        else if (strcmp(k, "coinbase_max_bytes")         == 0) cfg->coinbase_max_bytes = atoi(v);
+        else if (strcmp(k, "pplns_payout_floor_sats")    == 0) cfg->pplns_payout_floor_sats = strtoll(v, NULL, 10);
         else if (strcmp(k, "pps_sats_per_diff")         == 0) cfg->pps_sats_per_diff = atof(v);
+        else if (strcmp(k, "pps_min_network_difficulty") == 0) cfg->pps_min_network_difficulty = atof(v);
+        else if (strcmp(k, "block_interval_sec")        == 0) cfg->block_interval_sec = atoi(v);
+        else if (strcmp(k, "pps_refuse_shares_below_min") == 0) cfg->pps_refuse_shares_below_min = atoi(v);
         /* Retired with pool_mode=pps (the drivechain-in-coinbase build).
          * Accepted and ignored so an existing proxy.conf keeps loading;
          * the Thunder reserve address now lives only on the dashboard,
@@ -201,12 +356,96 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                 "that mode stranded the block reward. Use 'pps-classic'.");
         return -5;
     }
-    if (strcmp(cfg->pool_mode, "solo")        != 0 &&
-        strcmp(cfg->pool_mode, "pps-classic") != 0) {
+    if (strcmp(cfg->pool_mode, "pplns") == 0) {
         set_err(errbuf, errlen,
-                "config: 'pool_mode' must be 'solo' or 'pps-classic', got '%s'",
+                "config: 'pool_mode = pplns' does not say which rail pays. "
+                "Use 'pplns-thunder', 'pplns-btc' or 'pplns-coinbase' — an "
+                "operator runs one, and the rail decides what a stratum "
+                "username is and who ever holds the reward");
+        return -5;
+    }
+    /* Pays the window straight out of the coinbase of the block that produced
+     * it. Same accounting as the other two, and the pool never receives the
+     * reward at all — so there is no wallet, no payout worker and no maturity
+     * gate, because a reorged block simply never paid. */
+    int mode_cb_window = strcmp(cfg->pool_mode, "pplns-coinbase") == 0;
+    int mode_pplns = strcmp(cfg->pool_mode, "pplns-thunder") == 0 ||
+                     strcmp(cfg->pool_mode, "pplns-btc")     == 0 ||
+                     mode_cb_window;
+    if (strcmp(cfg->pool_mode, "solo")        != 0 &&
+        strcmp(cfg->pool_mode, "pps-classic") != 0 &&
+        !mode_pplns) {
+        set_err(errbuf, errlen,
+                "config: 'pool_mode' must be 'solo', 'pps-classic', "
+                "'pplns-thunder', 'pplns-btc' or 'pplns-coinbase', got '%s'",
                 cfg->pool_mode);
         return -5;
+    }
+    if (mode_cb_window && cfg->pool_btc_address[0] != '\0') {
+        /* Not a harmless leftover. The whole claim of this mode is that the
+         * pool never holds the reward, and a configured pool wallet is the
+         * shape of a pool that does — most likely a mode switched in place
+         * without the rest of the config following. Refusing beats running a
+         * custodial-looking pool that quietly is not one. */
+        set_err(errbuf, errlen,
+                "config: 'pool_btc_address' must not be set when "
+                "pool_mode=pplns-coinbase — this mode pays miners directly "
+                "from the coinbase and the pool never receives the reward");
+        return -9;
+    }
+    if (mode_pplns && !mode_cb_window) {
+        /* Same custody shape as pps-classic: the coinbase pays the pool, and
+         * the payout worker distributes. Without an address every rendered
+         * coinbase would fail at runtime instead of here. */
+        if (cfg->pool_btc_address[0] == '\0') {
+            set_err(errbuf, errlen,
+                    "config: 'pool_btc_address' is required when pool_mode=%s",
+                    cfg->pool_mode);
+            return -9;
+        }
+    }
+    if (mode_cb_window) {
+        /* The coinbase must have room for the transaction, the commitments
+         * and at least one payout. Below that no block can pay anyone, which
+         * is a pool that cannot run rather than one that runs badly. */
+        if (cfg->coinbase_max_bytes < 200) {
+            set_err(errbuf, errlen,
+                    "config: 'coinbase_max_bytes' = %d is too small to hold a "
+                    "coinbase and a single payout; 1000 is the default and a "
+                    "production coinbase-direct pool reports 721-817 bytes "
+                    "paying up to 16 miners",
+                    cfg->coinbase_max_bytes);
+            return -14;
+        }
+        /* A negative floor is a typo, not a policy. Zero is legitimate -- it
+         * means "pay anything the dust limit allows" -- so only reject below
+         * that, and let coinbase.c do the clamp up to the dust limit so the
+         * floor has one definition. */
+        if (cfg->pplns_payout_floor_sats < 0) {
+            set_err(errbuf, errlen,
+                    "config: 'pplns_payout_floor_sats' = %lld must be >= 0",
+                    (long long)cfg->pplns_payout_floor_sats);
+            return -15;
+        }
+    }
+    if (mode_pplns) {
+        if (!(cfg->pplns_window_diff_multiple > 0.0)) {
+            set_err(errbuf, errlen,
+                    "config: 'pplns_window_diff_multiple' must be > 0, got %g",
+                    cfg->pplns_window_diff_multiple);
+            return -13;
+        }
+        /* A window shorter than a block's expected work pays a block out
+         * across less work than it took to find, which rewards whoever
+         * happened to be connected at the moment rather than the work that
+         * actually produced it — and is precisely the hopping incentive
+         * PPLNS exists to remove. */
+        if (cfg->pplns_window_diff_multiple < 1.0) {
+            LOG_WARN("config: pplns_window_diff_multiple = %g is below 1.0 — "
+                     "the window covers less work than a block is expected to "
+                     "take, which rewards pool hopping",
+                     cfg->pplns_window_diff_multiple);
+        }
     }
     if (strcmp(cfg->pool_mode, "pps-classic") == 0) {
         /* pps_sats_per_diff is no longer required: unset means the rate is
@@ -222,6 +461,82 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
             set_err(errbuf, errlen,
                     "config: 'pool_btc_address' is required when pool_mode=pps-classic");
             return -9;
+        }
+        if (cfg->pps_min_network_difficulty < 0.0) {
+            set_err(errbuf, errlen,
+                    "config: 'pps_min_network_difficulty' cannot be negative "
+                    "(0 disables the check)");
+            return -10;
+        }
+    }
+    if (cfg->max_submits_per_sec < 0) {
+        set_err(errbuf, errlen,
+                "config: 'max_submits_per_sec' cannot be negative "
+                "(0 disables the ceiling)");
+        return -13;
+    }
+    if (cfg->auth_max_failures < 0) {
+        set_err(errbuf, errlen,
+                "config: 'auth_max_failures' cannot be negative "
+                "(0 disables the authorize budget)");
+        return -13;
+    }
+    /* A lockout window of zero with the budget on would expire every entry the
+     * instant it was written, so the per-address half would silently do
+     * nothing while the config claimed it was on. Refuse the combination
+     * rather than ship a limiter that cannot limit. */
+    if (cfg->auth_max_failures > 0 && cfg->auth_fail_lockout_sec <= 0) {
+        set_err(errbuf, errlen,
+                "config: 'auth_fail_lockout_sec' must be > 0 when "
+                "'auth_max_failures' is set (set auth_max_failures = 0 to "
+                "disable the authorize budget)");
+        return -13;
+    }
+    if (cfg->block_interval_sec <= 0) {
+        set_err(errbuf, errlen,
+                "config: 'block_interval_sec' must be > 0 (600 for Bitcoin)");
+        return -11;
+    }
+    /* Two listeners on one port, or a listener on listen_port. Caught here
+     * rather than at bind() because the failure there is EADDRINUSE —
+     * "Address already in use", which reads as another process holding the
+     * port and sends the operator hunting for one that does not exist. The
+     * ports are also checked against each other in file order, so the message
+     * names the line that is actually wrong. */
+    for (int i = 0; i < cfg->listener_count; ++i) {
+        if (cfg->listeners[i].port == cfg->listen_port) {
+            set_err(errbuf, errlen,
+                    "config: listener port %d is already listen_port — give "
+                    "the extra listener a different port",
+                    cfg->listeners[i].port);
+            return -12;
+        }
+        for (int j = 0; j < i; ++j) {
+            if (cfg->listeners[i].port == cfg->listeners[j].port) {
+                set_err(errbuf, errlen,
+                        "config: two listeners both use port %d",
+                        cfg->listeners[i].port);
+                return -12;
+            }
+        }
+    }
+    /* A rental port whose floor is under the marketplace threshold is legal —
+     * an operator may have a private customer with other requirements — but
+     * it is the setting that gets a public port refused, so name it rather
+     * than let it pass unremarked. Braiins wants 1024 minimum and 65536
+     * recommended; NiceHash wants 500000. */
+    for (int i = 0; i < cfg->listener_count; ++i) {
+        if (cfg->listeners[i].min_diff > 0.0 &&
+            cfg->listeners[i].min_diff < 1024.0) {
+            /* %g, not %.0f: a difficulty is not necessarily >= 1. On a
+             * forknet these are values like 3e-10, and %.0f renders every
+             * one of them as "0" — a warning naming the wrong number is
+             * worse than no warning. Matches how config.c prints difficulty
+             * everywhere else. */
+            LOG_WARN("config: listener port %d promises min_diff %g, below "
+                     "the 1024 floor rented-hashrate marketplaces require; a "
+                     "port advertised for rental at this level can be refused",
+                     cfg->listeners[i].port, cfg->listeners[i].min_diff);
         }
     }
     return 0;

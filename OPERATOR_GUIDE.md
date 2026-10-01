@@ -4,6 +4,26 @@ Everything you need to run this pool day-to-day. Assumes the branch
 already deployed (see `CLASSIC_PAYOUTS.md` for background on why the
 design looks like this).
 
+> **This guide is specific to `pool_mode = pps-classic`.** The pool ships five
+> modes and they differ in what a stratum username is, whether a payout worker
+> exists at all, and who holds the money in between — so the operational
+> advice below does not transfer wholesale. See
+> [the five modes](README.md#the-five-modes) for what each one is, and in
+> particular:
+>
+> - `solo` and `pplns-coinbase` have **no payout worker and no pool wallet**;
+>   the coinbase is the payment. Everything here about Thunder deposits, the
+>   reserve, and `simplepool-payout.service` simply does not apply.
+> - `pplns-thunder` and `pplns-btc` reuse this guide's payout worker, but pay
+>   on maturity out of a block actually found rather than a reserve, so there
+>   is no reserve to size or top up.
+> - `pplns-coinbase` additionally has a **payout floor**: a claim worth less
+>   than `pplns_payout_floor_sats` gets no output in that block. What it was
+>   owed is shared among the miners the block could pay — never you — and the
+>   skipped miner goes first in the queue for the next block. You take your fee
+>   and nothing else. That is a policy to publish to your miners, not just a
+>   setting. [`VERIFY.md` section 13](VERIFY.md) is its operational checklist.
+
 ---
 
 ## Quick reference
@@ -24,6 +44,12 @@ tracked by git.
 | Stratum (miner endpoint) | `stratum+tcp://<pool-host>:3334` | username = Thunder base58 address |
 | SSH | `root@<pool-host>` | `<ssh-key>` |
 | Everything from the shell | `simplepoolctl status` / `doctor` / `logs -f` | root for `restart`, `upgrade`, `uninstall` |
+
+The `:8081` URLs assume the dashboard listens publicly. Since it defaults to
+loopback (`DASHBOARD_BIND=127.0.0.1`), that needs
+`Environment=DASHBOARD_BIND=0.0.0.0` in
+`/etc/systemd/system/simplepool-dashboard.service.d/local.conf`; behind nginx,
+use `https://<your-domain>/` instead and leave it on loopback.
 
 The admin password is stashed at `/root/simplepool-admin-cred.txt` on the
 box (root-only). To rotate, edit
@@ -314,6 +340,108 @@ someone debug their config.
 `3Z6z1hPySN….basement`, `3Z6z1hPySN….garage`). They show as separate
 rows on the workers page but the same payout address on the admin
 view.
+
+---
+
+## Taking rented hashrate (Braiins, NiceHash)
+
+Rented hashrate does not arrive as many small miners. The marketplace
+aggregates a whole fleet behind **one** connection, so the share rate on
+that single socket is the fleet's entire hashrate divided by the
+difficulty you assign it. At difficulty 1024, 1 PH/s is **~227 shares per
+second**. That is why both marketplaces enforce a floor and refuse to
+deliver below it — Braiins wants at least 1024 and recommends 65536,
+NiceHash requires 500000.
+
+Do **not** try to serve them from the same port as your home miners, and
+do not rely on vardiff climbing into range. Vardiff moves by at most 4x
+per window, so from difficulty 1 it needs eight windows — four minutes at
+the 30s default — to reach 65536, and the reject flood on the way there
+is what gets an order cancelled. Add a port instead, already at the right
+difficulty:
+
+```ini
+# proxy.conf
+listener = port=3335 min_diff=65536 label=braiins
+listener = port=3336 min_diff=500000 label=nicehash
+```
+
+Open the new ports in the firewall — a `listener` line binds a socket, it
+does not touch `ufw`:
+
+```sh
+sudo ufw allow 3335/tcp
+sudo ufw allow 3336/tcp
+```
+
+Restart, and confirm both ports came up:
+
+```sh
+journalctl -u simplepool -n 20 | grep listening
+# stratum listening on 0.0.0.0:3334 (difficulty from 1)
+# stratum listening on 0.0.0.0:3335 — braiins (difficulty from 65536, floor 65536)
+```
+
+Then check they are reachable and not just bound, which the log cannot tell
+you apart:
+
+```sh
+sudo simplepoolctl doctor
+#     stratum port 3335 accepting connections     ok
+#     firewall allows port 3335                   ok
+```
+
+The dashboard's identity strip then lists every port with what it is for,
+so miners can pick without asking you.
+
+### Check what the chain costs you
+
+Share difficulty is normally capped at the network difficulty, because a
+miner filters locally against the stratum target — a harder share target
+throws away valid blocks before the pool ever sees them.
+
+**`min_diff` overrides that cap, on purpose.** Without the override a 500000
+port on a chain at difficulty 1200 really serves 1200, the marketplace
+measures what it was given, and the order is cancelled with nothing in your
+logs explaining it. So a port that states `min_diff` gets that difficulty
+held for it.
+
+**What you pay is blocks.** Miners on that port filter at the promised
+difficulty, so they discard solutions the chain would have accepted —
+roughly `min_diff / network_difficulty` of them. At 500000 over 1200 that is
+about 416 of every 417. Nothing else on the pool is affected: `listen_port`
+and any listener without a `min_diff` are capped exactly as before.
+
+You do not have to work either half out by hand. The pool warns at startup
+for every port in this position, and the dashboard runs a **"Stratum ports
+can hold their difficulty"** health check that distinguishes the two cases —
+
+> port 3335 (braiins) promises min_diff 65536 and the pool is holding it,
+> but network difficulty is only 1200. Miners there ... discard roughly 53
+> of every 55 blocks they solve
+
+versus, for a port that set no `min_diff`:
+
+> port 3336 (nicehash) is configured for difficulty 500000 but network
+> difficulty is only 1200, so miners there are served 1200 instead
+
+The first is a bill; decide whether the rented hashrate is worth it, or drop
+that port's `min_diff`. The second is a port that will not satisfy the
+marketplace at all — add `min_diff` if you want it held, or wait for the
+chain to retarget.
+
+### Before you tell them to send an order
+
+Verify what the pool advertises, from outside the box:
+
+```sh
+(echo '{"id":1,"method":"mining.subscribe","params":[]}'; sleep 1) \
+  | nc <pool-host> 3335 | head -1
+```
+
+The third element of `result` is `extranonce2_size`, and it must be **>=
+7** — marketplaces block the target below that, because their router has
+to slice the extranonce2 space per machine. simplepool advertises **8**.
 
 ---
 

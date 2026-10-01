@@ -6,6 +6,9 @@
 #include "log.h"
 #include "share.h"
 #include "store.h"
+#include "reconcile.h"
+#include "pplns.h"
+#include "coinbase.h"
 #include "stratum.h"
 #include "version.h"
 
@@ -17,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -134,7 +138,38 @@ typedef struct {
      * lock per share would not be. Zero means "no accrual" (solo, or a
      * template we could not derive a rate from). */
     _Atomic double  pps_rate;
+    /* Network difficulty from the most recent template. PPLNS reads it when a
+     * block is found, to snapshot the window that block will later be
+     * distributed across — by the time it matures the chain may have
+     * retargeted, and recomputing then would pay it out across a window its
+     * own miners never worked under. */
+    _Atomic double  net_difficulty;
+
+    /* Observed share-difficulty throughput, in difficulty units per second,
+     * and the window it is accumulated over. This is the pool's own hashrate
+     * expressed in the same units the PPS rate is paid in, which is what the
+     * issuance ceiling needs: accrual per second is rate * this. */
+    _Atomic double  diff_accum;        /* difficulty seen this window */
+    _Atomic uint64_t diff_window_ms;   /* when the window opened */
+    _Atomic double  diff_per_sec;      /* last completed measurement, 0 = none */
+
+    /* Set when accrual is refused because network difficulty is below
+     * cfg->pps_min_network_difficulty. Read by the stratum server, which
+     * turns miners away rather than letting them work uncredited. */
+    _Atomic int     pps_gated;
+
+    /* Whether the backend serves getblockhash: 0 unknown, 1 yes, -1 no.
+     * Latched on the first "Method not found", because a backend that does
+     * not implement the method never starts to — the CUSF enforcer serves
+     * exactly getblocktemplate and submitblock. -1 is not a failure state,
+     * it selects the observed-tip path. */
+    _Atomic int     gbh_state;
 } server_ctx_t;
+
+/* How long to accumulate share difficulty before turning it into a rate.
+ * Long enough to be stable, short enough that a pool starting up is measured
+ * within a minute. */
+#define HASHRATE_WINDOW_MS 60000
 
 /* The rate this proxy will credit at: the operator's override verbatim if
  * set, otherwise fair value derived from the template. See the
@@ -144,6 +179,306 @@ static double effective_pps_rate(const proxy_config_t *cfg,
                                  int64_t value_sats, double net_diff) {
     if (cfg->pps_sats_per_diff > 0.0) return cfg->pps_sats_per_diff;
     return pps_rate_from_template(value_sats, net_diff, cfg->fee_bps);
+}
+
+/* Stage what a found block's coinbase did to the payout queue.
+ *
+ * Staged, not applied: this block is a candidate, and a block that never
+ * stands rotated nobody. reconcile_blocks_pass() applies these once the block
+ * is confirmed and discards them if it is orphaned. */
+static void on_window_fractions_cb(void *ctx, const char *block_hash,
+                                   const struct store_fraction_delta *deltas,
+                                   size_t n) {
+    server_ctx_t *s = (server_ctx_t *)ctx;
+    if (!s || !s->store || !deltas || n == 0) return;
+    char ferr[256] = {0};
+    int rc = store_stage_block_fractions(s->store, block_hash, deltas, n,
+                                         ferr, sizeof ferr);
+    if (rc < 0) {
+        /* Not fatal — the block is paid either way, this only decides whose
+         * turn is next. Worth a warning because a queue that stops recording
+         * silently reverts to "largest claim always wins". */
+        LOG_WARN("pplns-coinbase: could not record the payout queue for block "
+                 "%.16s: %s — rotation for this block is lost",
+                 block_hash ? block_hash : "?", ferr);
+        return;
+    }
+    LOG_DEBUG("pplns-coinbase: staged %d payout-queue row(s) for block %.16s",
+              rc, block_hash ? block_hash : "?");
+}
+
+/* The tightest coinbase byte ceiling any connection can be subject to.
+ *
+ * The window and its payment order are decided ONCE, per template, on the tip
+ * watcher — but the ceiling that cuts that order short is per-listener, and a
+ * rented port's is deliberately far tighter than a home port's. One order has
+ * to serve both, so the reservation has to be sized for the tightest of them.
+ *
+ * The two errors are not symmetric. Size it from a generous ceiling and the
+ * tight port reserves more positions than it has slots, so every slot it does
+ * have goes to the queue: the largest claims are paid nothing, immediately
+ * re-enter the queue themselves, and the rotation oscillates instead of
+ * rotating. Size it from the tight one and the generous port simply reserves
+ * fewer slots than it could have — it rotates more slowly and nothing else
+ * changes. So: the minimum, and never the configured server-wide figure on
+ * its own (LayerTwo-Labs/simplepool#76).
+ *
+ * bind_port is always served on the server-wide ceiling, so that is always in
+ * the running. */
+static size_t tightest_coinbase_budget(const proxy_config_t *cfg) {
+    size_t b = cfg->coinbase_max_bytes > 0
+             ? (size_t)cfg->coinbase_max_bytes
+             : (size_t)COINBASE_DEFAULT_MAX_BYTES;
+    for (int i = 0; i < cfg->listener_count; ++i) {
+        int lb = cfg->listeners[i].max_coinbase_bytes;
+        if (lb > 0 && (size_t)lb < b) b = (size_t)lb;
+    }
+    return b;
+}
+
+/* Snapshot the PPLNS window onto a freshly built job, for pplns-coinbase.
+ *
+ * The window is taken from the template that is about to go out, so the
+ * coinbase pays the work that exists NOW. That is the whole difference from
+ * the other two rails, which read the window ~100 blocks later out of a block
+ * that already matured. There is nothing to mature here: the payment IS the
+ * block, so a reorged block simply never paid and there is no credit to claw
+ * back.
+ *
+ * Returns 0 when the job may be published. Non-zero means no coinbase can be
+ * rendered from it -- an empty window, or arithmetic that would not add up --
+ * and the caller must not publish it: a coinbase paying nobody forfeits the
+ * whole block.
+ */
+static int attach_pplns_window(store_t *store, const proxy_config_t *cfg,
+                               double net_diff, const bitcoind_template_t *t,
+                               stratum_job_t *job) {
+    if (strcmp(cfg->pool_mode, "pplns-coinbase") != 0) return 0;
+    if (!(net_diff > 0.0)) {
+        LOG_WARN("pplns-coinbase: no network difficulty yet — cannot size the "
+                 "window, holding this template back");
+        return -1;
+    }
+    double window = net_diff * cfg->pplns_window_diff_multiple;
+
+    store_window_entry_t win[COINBASE_MAX_PAYOUT_OUTPUTS];
+    size_t n = 0;
+    double total = 0.0;
+    int truncated = 0;
+    char werr[256] = {0};
+    if (store_pplns_window(store, window, win,
+                           sizeof win / sizeof win[0], &n, &total,
+                           &truncated, werr, sizeof werr) < 0) {
+        LOG_WARN("pplns-coinbase: window query failed: %s", werr);
+        return -1;
+    }
+    if (n == 0 || !(total > 0.0)) {
+        /* Bootstrap. A pool that has never been mined has no shares, so it
+         * has no window, so it cannot build a coinbase — and if that stopped
+         * it publishing a job, no miner could ever submit the share that
+         * would populate the window. A brand-new pool would never start.
+         *
+         * The job goes out with no window attached and the renderer falls
+         * back to paying whoever is connected, per connection, exactly as
+         * solo does. That is not a special case so much as what PPLNS over an
+         * empty window degenerates to: with no prior work, the only party
+         * with a claim on the block is whoever finds it.
+         *
+         * Self-correcting, and only ever true once — the first accepted share
+         * populates the window, and every job after it carries one. */
+        LOG_INFO("pplns-coinbase: no shares yet, so no window; this template "
+                 "pays whoever finds it, as solo would. The first accepted "
+                 "share ends this.");
+        return 0;
+    }
+    if (truncated) {
+        /* store_pplns_window drops the tail from the TOTAL as well, so those
+         * miners' claims are redistributed to the ones that fit rather than
+         * carried as a debt. Say so: it is a real, if small, unfairness and
+         * it should not be discovered in the amounts. */
+        LOG_WARN("pplns-coinbase: window holds more than %zu payable miners; "
+                 "the smallest are not in this block's coinbase and their "
+                 "share of it goes to the others",
+                 (size_t)(sizeof win / sizeof win[0]));
+    }
+
+    /* Split the payable amount by difficulty. The fee comes off the top the
+     * same way every other builder does it, so it is computed here too --
+     * the payees have to sum to exactly what is left, or the builder refuses
+     * rather than letting the block forfeit the difference.
+     *
+     * On a server-provided coinbase the number to divide is what that
+     * transaction's spendable output actually pays, NOT the template's
+     * coinbase_value_sats, which is the SUM of every output. They agree
+     * whenever the commitments carry no value, which is the only shape seen
+     * in practice -- but "agree in practice" is exactly the kind of premise
+     * that fails on somebody else's node, and the failure has no floor: the
+     * payees would no longer sum to the reward, so the builder would refuse
+     * every render, on every connection, and the pool would stop publishing
+     * work with nothing but a repeated warning to explain it.
+     *
+     * Ask the transaction instead, and the premise cannot fail. If it cannot
+     * be asked, refuse THIS template with a reason rather than mining a split
+     * that the builder will reject a thousand times over. */
+    int64_t value = t->coinbase_value_sats;
+    if (t->coinbasetxn_hex) {
+        int64_t from_tx = 0;
+        if (coinbase_template_reward(t->coinbasetxn_hex, &from_tx) < 0) {
+            LOG_WARN("pplns-coinbase: the template's coinbase does not have a "
+                     "single spendable output to replace — no window can be "
+                     "paid from it, so this template is skipped");
+            return -1;
+        }
+        if (from_tx != value) {
+            LOG_WARN("pplns-coinbase: template says coinbasevalue=%lld but its "
+                     "coinbase pays %lld — splitting what the transaction "
+                     "actually pays",
+                     (long long)value, (long long)from_tx);
+        }
+        value = from_tx;
+    }
+    /* The arithmetic lives in pplns.c so it can be tested against stated
+     * numbers rather than only against a chain -- it decides what people are
+     * paid, and it used to be unreachable from any test. See pplns.h. */
+    pplns_claim_t claims[COINBASE_MAX_PAYOUT_OUTPUTS];
+    for (size_t i = 0; i < n; ++i) {
+        claims[i].payout_address = win[i].payout_address;
+        claims[i].difficulty     = win[i].difficulty;
+        claims[i].worker_id      = win[i].worker_id;
+        claims[i].owed_fraction  = win[i].owed_fraction;
+    }
+
+    /* What each claim is worth, BEFORE deciding who gets a slot.
+     *
+     * This used to run the other way round -- order, then split the reordered
+     * claims -- which cost two things. The splitter's truncation remainder
+     * lands on claims[0], which it documents as the largest claim, and after a
+     * reordering that was whoever the queue had promoted. And, more to the
+     * point, the ordering had no idea what anybody was worth, so it could
+     * reserve a slot for a claim the floor was about to drop.
+     *
+     * Splitting first fixes both. The split is proportional, so the order does
+     * not change a single amount -- only which index carries the remainder --
+     * and the permutation below moves the payees with their claims. */
+    coinbase_payee_t by_claim[COINBASE_MAX_PAYOUT_OUTPUTS];
+    pplns_split_t split;
+    char serr[256] = {0};
+    if (pplns_split_window(value, cfg->fee_bps, cfg->operator_address[0] != 0,
+                           claims, n, total, cfg->pplns_payout_floor_sats,
+                           by_claim, COINBASE_MAX_PAYOUT_OUTPUTS,
+                           &split, serr, sizeof serr) < 0) {
+        LOG_WARN("pplns-coinbase: cannot split this block across the window: "
+                 "%s", serr);
+        return -1;
+    }
+
+    /* If NOTHING clears the floor there is no coinbase to render from this
+     * window at all -- the builder refuses a window it cannot pay anybody
+     * from, on the same reasoning as the splitter above. Catch it here, where
+     * it can be said once with a cause, rather than letting it surface as a
+     * render failure on every connection for every job: that is a pool that
+     * publishes no work while logging a warning per miner per template, which
+     * is precisely the shape of failure the template-reward check above exists
+     * to avoid.
+     *
+     * Reachable without anything exotic. A small block reward divided across
+     * enough miners puts every claim under the dust limit -- 5000 sats across
+     * 20 miners is 250 each -- and a configured floor reaches it far sooner.
+     * The numbers are in the message because the fix is arithmetic the
+     * operator can do: raise the reward, lower the floor, or accept fewer
+     * miners. */
+    if (split.below_floor >= n) {
+        LOG_WARN("pplns-coinbase: not one of the %zu miner(s) in the window "
+                 "clears the %lld-sat payout floor — %lld sats split %zu ways "
+                 "pays nobody, so this template is skipped and NO WORK IS "
+                 "PUBLISHED from it. Lower pplns_payout_floor_sats, or accept "
+                 "fewer miners in the window (pplns_window_diff_multiple).",
+                 n, (long long)(cfg->pplns_payout_floor_sats < COINBASE_DUST_SATS
+                                ? COINBASE_DUST_SATS
+                                : cfg->pplns_payout_floor_sats),
+                 (long long)split.payable_sats, n);
+        return -1;
+    }
+
+    /* Now decide who gets the slots the coinbase has room for.
+     *
+     * Paying the largest claims first — which is what the builder used to do
+     * on its own — hands the same addresses the same slots every block,
+     * because a large miner's share of the window beats any priority a small
+     * one can accumulate. A fraction of the slots is therefore reserved for
+     * whoever has waited longest. Costs no bytes, changes nobody's total,
+     * changes only how often people are paid.
+     *
+     * `by_claim` goes in so the reservation is not spent on a claim the floor
+     * is about to drop: it could not be paid from a reserved slot either, and
+     * a permanently sub-floor miner's owed_fraction only ever grows, so it
+     * would crowd out the byte-capped miners the rotation is for. */
+    /* The real addresses, in claim order, so the estimate charges each output
+     * what it costs instead of assuming P2WPKH. */
+    const char *addrs[COINBASE_MAX_PAYOUT_OUTPUTS];
+    for (size_t i = 0; i < n; ++i) addrs[i] = claims[i].payout_address;
+    size_t expected_slots = coinbase_expected_payout_slots(
+        tightest_coinbase_budget(cfg), t->coinbasetxn_hex, addrs, n);
+    size_t order[COINBASE_MAX_PAYOUT_OUTPUTS];
+    if (pplns_order_claims(claims, n, expected_slots, by_claim,
+                           cfg->pplns_payout_floor_sats, order) < 0) {
+        LOG_WARN("pplns-coinbase: could not order the window for payment");
+        return -1;
+    }
+
+    /* Permute the payees and their workers into payment order together. The
+     * amounts are unchanged by this -- a permutation moves who is paid first,
+     * never what anybody is paid -- and the pair has to stay aligned because
+     * stratum.c reads the worker out of the same index the builder reports as
+     * paid or skipped. */
+    coinbase_payee_t payees[COINBASE_MAX_PAYOUT_OUTPUTS];
+    int64_t worker_ids[COINBASE_MAX_PAYOUT_OUTPUTS];
+    for (size_t i = 0; i < n; ++i) {
+        payees[i]     = by_claim[order[i]];
+        worker_ids[i] = claims[order[i]].worker_id;
+    }
+
+    if (stratum_job_set_window(job, payees, worker_ids, n) < 0) {
+        LOG_WARN("pplns-coinbase: could not attach the window to the job");
+        return -1;
+    }
+
+    /* Warn about miners the floor will exclude, BEFORE a block makes it real.
+     *
+     * The per-block line in stratum.c reports what was forfeited after the
+     * fact; this reports who is about to be, which is the only form an
+     * operator can act on -- by telling those miners, or by lowering the
+     * floor. Rate-limited to changes in the count, because it is recomputed
+     * on every template and a steady state is not news -- the static needs no
+     * lock: main() calls this once for the initial job before the
+     * template-poller thread exists, and only that thread calls it after.
+     *
+     * The clamp mirrors coinbase.c's: below the dust limit there is no floor
+     * to have, so reporting an unclamped one would understate who loses. */
+    int64_t floor_sats = cfg->pplns_payout_floor_sats < COINBASE_DUST_SATS
+                       ? COINBASE_DUST_SATS : cfg->pplns_payout_floor_sats;
+    size_t below = split.below_floor;
+    static size_t last_below = (size_t)-1;
+    if (below != last_below) {
+        last_below = below;
+        if (below > 0) {
+            LOG_INFO("pplns-coinbase: %zu of %zu miner(s) in the window are "
+                     "below the %lld-sat payout floor and will earn NOTHING "
+                     "from the next block — their share goes to the miners "
+                     "the block CAN pay, and they move to the front of the "
+                     "payout queue for a later one. Nothing reaches the "
+                     "operator, which takes its fee and nothing else. Tell "
+                     "them, or lower pplns_payout_floor_sats.",
+                     below, n, (long long)floor_sats);
+        } else {
+            LOG_INFO("pplns-coinbase: every miner in the window clears the "
+                     "%lld-sat payout floor", (long long)floor_sats);
+        }
+    }
+
+    LOG_DEBUG("pplns-coinbase: window of %zu miner(s), %.2f difficulty, "
+              "paying %lld sats", n, total, (long long)split.payable_sats);
+    return 0;
 }
 
 /* Build a job from a freshly fetched template. The coinbase is rendered
@@ -233,7 +568,7 @@ static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
         job_id, t->version, prev_le,
         t->coinbase_value_sats,
         t->default_witness_commitment,
-        /*en1*/ 4, /*en2*/ 4,
+        STRATUM_EXTRANONCE1_SIZE, STRATUM_EXTRANONCE2_SIZE,
         (const uint8_t (*)[32])branches, branch_count,
         t->bits, t->curtime, target_be,
         (uint32_t)t->height,
@@ -261,6 +596,28 @@ static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
  * Warns when an override implies a materially different fee from fee_bps —
  * that mismatch is invisible otherwise, and a stale override is how the fee
  * silently drifts to zero (or negative) as difficulty moves. */
+/* Close the hashrate window if it has run long enough, and return the best
+ * available difficulty-per-second measurement (0 when there is none yet). */
+static double observed_diff_per_sec(server_ctx_t *s) {
+    uint64_t now = now_ms();
+    uint64_t opened = atomic_load_explicit(&s->diff_window_ms, memory_order_relaxed);
+    if (opened == 0) {
+        atomic_store_explicit(&s->diff_window_ms, now, memory_order_relaxed);
+        return 0.0;
+    }
+    if (now - opened >= HASHRATE_WINDOW_MS) {
+        double accum = atomic_exchange_explicit(&s->diff_accum, 0.0,
+                                                memory_order_relaxed);
+        atomic_store_explicit(&s->diff_window_ms, now, memory_order_relaxed);
+        double secs = (double)(now - opened) / 1000.0;
+        if (secs > 0.0) {
+            atomic_store_explicit(&s->diff_per_sec, accum / secs,
+                                  memory_order_relaxed);
+        }
+    }
+    return atomic_load_explicit(&s->diff_per_sec, memory_order_relaxed);
+}
+
 static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
     if (!s || !s->cfg || !t) return;
 
@@ -272,6 +629,10 @@ static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
         nbits_to_target(t->bits, target_be);
     }
     double net_diff = target_to_diff(target_be);
+    if (net_diff > 0.0 && isfinite(net_diff)) {
+        atomic_store_explicit(&s->net_difficulty, net_diff,
+                              memory_order_relaxed);
+    }
     int64_t value   = t->coinbase_value_sats;
 
     int overridden  = s->cfg->pps_sats_per_diff > 0.0;
@@ -283,6 +644,69 @@ static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
     double eff_fee_bps = (gross > 0.0) ? (1.0 - rate / gross) * 10000.0 : 0.0;
 
     int accrues = strcmp(s->cfg->pool_mode, "pps-classic") == 0;
+
+    /* Two guards, in order. Both only matter while accruing.
+     *
+     * The floor is the operator's, and it is the one that works from the
+     * first share: below the configured difficulty the fair-value formula is
+     * not fair, so nothing accrues at all. The ceiling is automatic and needs
+     * no configuration, but it needs a hashrate measurement, so it cannot
+     * cover the first minute after a restart. They cover each other. */
+    double dps = observed_diff_per_sec(s);
+    int gated = 0;
+    if (accrues && s->cfg->pps_min_network_difficulty > 0.0 &&
+        net_diff > 0.0 && net_diff < s->cfg->pps_min_network_difficulty) {
+        gated = 1;
+        rate = 0.0;
+    }
+    if (accrues && !gated) {
+        double capped = pps_rate_apply_issuance_ceiling(
+            rate, value, dps, s->cfg->block_interval_sec);
+        if (capped < rate) {
+            LOG_WARN("pps rate capped at %.6f sats/diff (fair value says "
+                     "%.6f): at %.2f difficulty/s this pool would accrue "
+                     "faster than the chain can issue %lld sats every %ds. "
+                     "Network difficulty %.2f is below the %.2f this pool's "
+                     "own hashrate requires — set "
+                     "pps_min_network_difficulty and stop accruing until the "
+                     "chain catches up.",
+                     capped, rate, dps, (long long)value,
+                     s->cfg->block_interval_sec, net_diff,
+                     pps_min_safe_difficulty(dps, s->cfg->block_interval_sec));
+        }
+        rate = capped;
+    }
+
+    /* Report the transition, not every template — this path runs per poll. */
+    int was_gated = atomic_exchange_explicit(&s->pps_gated, gated,
+                                             memory_order_relaxed);
+    if (accrues && gated && !was_gated) {
+        LOG_WARN("PPS ACCRUAL SUSPENDED: network difficulty %.2f is below the "
+                 "configured floor of %.2f. Shares are not being credited "
+                 "because at this difficulty each one would be priced as "
+                 "though it were worth a whole block. Accrual resumes on its "
+                 "own once the chain retargets.",
+                 net_diff, s->cfg->pps_min_network_difficulty);
+    } else if (accrues && !gated && was_gated) {
+        LOG_INFO("pps accrual resumed: network difficulty %.2f is at or above "
+                 "the configured floor of %.2f", net_diff,
+                 s->cfg->pps_min_network_difficulty);
+    }
+
+    /* No floor configured is a real risk, not a neutral default. Say so once
+     * there is a measurement to say it with. */
+    if (accrues && s->cfg->pps_min_network_difficulty <= 0.0 && dps > 0.0) {
+        double need = pps_min_safe_difficulty(dps, s->cfg->block_interval_sec);
+        if (need > 0.0 && net_diff > 0.0 && net_diff < need) {
+            LOG_WARN("pps_min_network_difficulty is unset and network "
+                     "difficulty %.2f is below the %.2f this pool's own "
+                     "%.2f difficulty/s requires. Every share is being priced "
+                     "as though the chain could absorb it; it cannot. Set "
+                     "pps_min_network_difficulty=%.0f",
+                     net_diff, need, dps, need);
+        }
+    }
+
     atomic_store_explicit(&s->pps_rate, accrues ? rate : 0.0,
                           memory_order_relaxed);
 
@@ -370,6 +794,16 @@ static void on_share_cb(void *ctx, const char *worker_name,
                         const char *block_hash_or_null) {
     server_ctx_t *s = (server_ctx_t *)ctx;
 
+    /* Fold this share into the hashrate window. Difficulty per second is what
+     * the issuance ceiling is judged against — accrual per second is exactly
+     * rate * this — so it is accumulated in the same units the rate is paid
+     * in, before any decision about crediting. */
+    if (s) {
+        double prev = atomic_load_explicit(&s->diff_accum, memory_order_relaxed);
+        atomic_store_explicit(&s->diff_accum, prev + difficulty,
+                              memory_order_relaxed);
+    }
+
     /* PPS accrual. Credit the worker proportional to share difficulty at the
      * rate derived from the current template (or the operator's override).
      * Truncates to whole sats; sub-sat dust accumulates per-share so over
@@ -434,37 +868,115 @@ static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
     }
 }
 
-static void on_block_cb(void *ctx, const char *block_hex) {
+/* Returns 0 when the node accepted the block, non-zero when it refused.
+ * The caller records the candidate accordingly — a refusal that goes only to
+ * the log is what let rejected candidates be counted as pool revenue. */
+static int on_block_cb(void *ctx, const char *block_hex,
+                       char *errbuf, size_t errlen) {
     server_ctx_t *s = (server_ctx_t *)ctx;
-    if (!s || !s->btc) return;
-    char err[512] = {0};
-    int rc = bitcoind_submit_block(s->btc, block_hex, err, sizeof err);
+    if (!s || !s->btc) {
+        snprintf(errbuf, errlen, "no bitcoind client");
+        return -1;
+    }
+    int rc = bitcoind_submit_block(s->btc, block_hex, errbuf, errlen);
     if (rc == 0) {
         LOG_INFO("submitted block to bitcoind successfully");
     } else {
-        LOG_ERROR("submitblock failed: %s", err);
+        LOG_ERROR("submitblock failed: %s", errbuf);
     }
+    return rc;
 }
 
 static void on_block_found_cb(void *ctx, const char *worker_name,
                               const char *finder_address,
                               uint64_t ts_ms, uint32_t height,
                               const char *block_hash,
-                              int64_t reward_sats, int64_t fee_sats) {
+                              int64_t reward_sats, int64_t fee_sats,
+                              int accepted, const char *submit_error) {
     server_ctx_t *s = (server_ctx_t *)ctx;
+    /* Accepted only makes it a candidate the chain has not rejected — it is
+     * still 'pending' until something verifies the block is in the chain.
+     * Nothing here may write 'confirmed'. */
+    int status = accepted ? STORE_BLOCK_PENDING : STORE_BLOCK_REJECTED;
     if (s && s->store) {
+        /* Snapshot the PPLNS window for this block. Zero in every other mode,
+         * and zero here too if no template has been priced yet — a block with
+         * no window is skipped by the distributor rather than distributed
+         * across a window of nothing. */
+        double window_diff = 0.0;
+        if (s->cfg && s->cfg->pplns_window_diff_multiple > 0.0 &&
+            (strcmp(s->cfg->pool_mode, "pplns-thunder") == 0 ||
+             strcmp(s->cfg->pool_mode, "pplns-btc") == 0)) {
+            double nd = atomic_load_explicit(&s->net_difficulty,
+                                             memory_order_relaxed);
+            if (nd > 0.0) window_diff = nd * s->cfg->pplns_window_diff_multiple;
+        }
         store_record_block(s->store, ts_ms, (int)height, block_hash,
                            worker_name, finder_address,
-                           reward_sats, fee_sats);
+                           reward_sats, fee_sats, status,
+                           accepted ? NULL : submit_error,
+                           window_diff);
     }
-    if (s && s->bcast) {
+    /* pool:blocks carries solved blocks. A candidate the node refused is not
+     * one, so it does not go out on that channel — the DB row is where a
+     * refusal is visible. */
+    if (s && s->bcast && accepted) {
         broadcast_block(s->bcast, worker_name, finder_address,
                         ts_ms, height, block_hash, reward_sats, fee_sats);
     }
-    LOG_INFO("BLOCK FOUND: height=%u finder=%s reward=%lld fee=%lld hash=%s",
-             height, worker_name ? worker_name : "?",
-             (long long)reward_sats, (long long)fee_sats,
-             block_hash ? block_hash : "?");
+    if (accepted) {
+        LOG_INFO("BLOCK CANDIDATE ACCEPTED: height=%u finder=%s reward=%lld "
+                 "fee=%lld hash=%s (pending confirmation)",
+                 height, worker_name ? worker_name : "?",
+                 (long long)reward_sats, (long long)fee_sats,
+                 block_hash ? block_hash : "?");
+    } else {
+        LOG_WARN("BLOCK CANDIDATE REJECTED: height=%u finder=%s hash=%s "
+                 "reason=%s", height, worker_name ? worker_name : "?",
+                 block_hash ? block_hash : "?",
+                 submit_error && submit_error[0] ? submit_error : "unknown");
+    }
+}
+
+/* ---------- block confirmation ---------- */
+
+/* Decide which of the pool's candidates are actually in the chain.
+ *
+ * Preferred path is getblockhash: authoritative, one call per unresolved
+ * candidate. Not always available — the CUSF enforcer, which is the backend a
+ * drivechain pool must point at, answers "Method not found" to everything but
+ * getblocktemplate and submitblock. So fall back to the chain of tips the pool
+ * has already observed: a template building height H+1 with prev_hash X says
+ * the node's tip at H was X. That needs no RPC at all.
+ *
+ * Whichever answered is recorded in checked_via, the same way
+ * pool_meta.network_source distinguishes an authoritative answer from an
+ * inferred one. Nothing here invents a verdict: a candidate that neither path
+ * can speak to stays pending, and pending counts as nothing. */
+/* Adapter: the pass needs one thing from the network, and this is it.
+ * Everything else it touches is the store, which a test can hand it directly.
+ * See reconcile.h. */
+static int reconcile_get_block_hash(void *ctx, int height, char *out,
+                                    size_t out_len, char *err, size_t err_len)
+{
+    return bitcoind_get_block_hash((bitcoind_client_t *)ctx, height,
+                                   out, out_len, err, err_len);
+}
+
+static void reconcile_blocks(server_ctx_t *s, int tip_height) {
+    if (!s) return;
+    const int pplns = s->cfg &&
+        (strcmp(s->cfg->pool_mode, "pplns-thunder") == 0 ||
+         strcmp(s->cfg->pool_mode, "pplns-btc") == 0);
+    reconcile_cfg_t cfg = {
+        .store              = s->store,
+        .get_block_hash     = reconcile_get_block_hash,
+        .get_block_hash_ctx = s->btc,
+        .gbh_state          = &s->gbh_state,
+        .pplns              = pplns,
+        .fee_bps            = s->cfg ? s->cfg->fee_bps : 0,
+    };
+    reconcile_blocks_pass(&cfg, tip_height, NULL);
 }
 
 /* ---------- tip watcher ---------- */
@@ -523,16 +1035,49 @@ static void *tip_watcher(void *arg) {
             broadcast_node_tip(s->bcast, t->height - 1, t->prev_hash_hex, now_s);
         }
 
-        int need_rebuild = 0;
+        /* Two different reasons to rebuild, and they are not interchangeable.
+         *
+         * A tip change invalidates every job in every miner's hands: they all
+         * build on a parent that is no longer the tip. That is the one case
+         * where the miner must throw its work away, and the one case that
+         * carries clean_jobs = true.
+         *
+         * The periodic refresh is housekeeping — a fresher ntime and whatever
+         * transactions arrived meanwhile. The job the miner already holds is
+         * still valid, still builds on the current tip, and the pool goes on
+         * accepting submits against it out of the recent ring. Flagging it
+         * clean would discard work in flight on every connected miner roughly
+         * twenty times per block, for nothing. */
+        int need_rebuild = 0, new_tip = 0;
         pthread_mutex_lock(&s->lock);
         if (t->height != s->last_height ||
             strcmp(t->prev_hash_hex, s->last_prev_hash) != 0) {
             need_rebuild = 1;
+            new_tip = 1;
         } else if (now_ms() - s->last_built_ms > 30000) {
             /* Periodic refresh for new ntime + included txs. */
             need_rebuild = 1;
         }
         pthread_mutex_unlock(&s->lock);
+
+        /* A new tip is exactly when a candidate's fate can have changed:
+         * either it is the one that extended the chain, or something else
+         * was.
+         *
+         * new_tip, not a comparison of our own against last_height.
+         * last_height holds the TEMPLATE height, which is the tip plus one,
+         * so `t->height - 1 != s->last_height` asks whether the new tip
+         * differs from the previous tip PLUS ONE. On an ordinary one-block
+         * advance that is false -- the single most common event on any
+         * chain, and the one case this has to catch. It fired only when the
+         * tip jumped two or more blocks between polls, which is why blocks
+         * sat at 'pending' on a quiet chain and PPLNS, whose distribution
+         * hangs off this pass, credited nobody at all.
+         *
+         * new_tip is computed above from both the height and the previous
+         * hash, so it also catches a reorg that replaces the tip at the same
+         * height -- which a height comparison of any kind cannot see. */
+        if (new_tip) reconcile_blocks(s, t->height - 1);
 
         if (need_rebuild) {
             char berr[256] = {0};
@@ -542,7 +1087,20 @@ static void *tip_watcher(void *arg) {
                 bitcoind_template_free(t);
                 continue;
             }
-            stratum_server_set_job(s->srv, job);
+            /* pplns-coinbase pays the window out of this block's own
+             * coinbase, so the window has to be on the job before anyone
+             * mines it. A job that cannot carry one is not published: every
+             * coinbase rendered from it would pay nobody, which forfeits the
+             * whole block. */
+            if (attach_pplns_window(s->store, s->cfg,
+                                    atomic_load_explicit(&s->net_difficulty,
+                                                         memory_order_relaxed),
+                                    t, job) != 0) {
+                stratum_job_free(job);
+                bitcoind_template_free(t);
+                continue;
+            }
+            stratum_server_set_job(s->srv, job, new_tip);
             /* Difficulty and block value move with the template, so the
              * rate has to move with it too. */
             refresh_pps_rate(s, t);
@@ -552,8 +1110,9 @@ static void *tip_watcher(void *arg) {
                      t->prev_hash_hex);
             s->last_built_ms = now_ms();
             pthread_mutex_unlock(&s->lock);
-            LOG_INFO("new job: height=%d prev=%.16s... txs=%zu",
-                     t->height, t->prev_hash_hex, t->tx_count);
+            LOG_INFO("new job: height=%d prev=%.16s... txs=%zu clean_jobs=%s",
+                     t->height, t->prev_hash_hex, t->tx_count,
+                     new_tip ? "true (new tip)" : "false (refresh)");
         }
         if (t->longpollid) {
             if (lpid[0] == '\0') {
@@ -568,6 +1127,62 @@ static void *tip_watcher(void *arg) {
     return NULL;
 }
 
+/* ---------- pool identity ---------- */
+
+/* Which chain this pool is mining, and how confidently we know it.
+ *
+ * getblockchaininfo is authoritative, so ask first. It is also not always
+ * available: the CUSF enforcer serves getblocktemplate and submitblock and
+ * answers "Method not found" to everything else, and that enforcer is
+ * precisely the backend a drivechain pool has to point at for BIP300/301
+ * commitments. So fall back to the network encoded in operator_address —
+ * which is weaker (it cannot tell testnet from signet) but never wrong about
+ * mainnet — and record which of the two answered, so the dashboard can say
+ * "inferred" instead of asserting.
+ *
+ * Also the only place the two are ever compared. A mainnet operator address
+ * on a test chain, or the reverse, pays the fee to a script nobody on that
+ * chain controls: the block is valid, the coinbase looks fine, and the
+ * money is gone. That is worth a loud line in the journal. */
+static void resolve_network(bitcoind_client_t *btc, const proxy_config_t *cfg,
+                            char *net, size_t net_cap,
+                            char *src, size_t src_cap) {
+    const char *from_addr = coinbase_address_network(cfg->operator_address);
+    char node_chain[32] = {0};
+    char nerr[256] = {0};
+
+    if (bitcoind_get_chain(btc, node_chain, sizeof node_chain,
+                           nerr, sizeof nerr) == 0) {
+        snprintf(net, net_cap, "%s", node_chain);
+        snprintf(src, src_cap, "node");
+        if (from_addr &&
+            coinbase_network_is_mainnet(node_chain) !=
+            coinbase_network_is_mainnet(from_addr)) {
+            LOG_WARN("operator_address '%s' is a %s address but the node is "
+                     "on '%s' — the %d bps fee would pay a script nobody on "
+                     "this chain controls. Fix operator_address before "
+                     "mining a block.",
+                     cfg->operator_address, from_addr, node_chain,
+                     cfg->fee_bps);
+        }
+        return;
+    }
+
+    if (from_addr) {
+        snprintf(net, net_cap, "%s", from_addr);
+        snprintf(src, src_cap, "inferred");
+        LOG_INFO("network: backend does not answer getblockchaininfo (%s); "
+                 "inferred '%s' from operator_address", nerr, from_addr);
+        return;
+    }
+
+    snprintf(net, net_cap, "unknown");
+    snprintf(src, src_cap, "unknown");
+    LOG_WARN("network: could not determine which chain this pool is mining "
+             "(getblockchaininfo: %s, and operator_address '%s' encodes no "
+             "network)", nerr, cfg->operator_address);
+}
+
 /* ---------- usage ---------- */
 
 static void usage(const char *prog) {
@@ -579,6 +1194,11 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+    /* Before any socket can exist. stratum_server_start() spawns the listener
+     * well before this used to run, leaving a window where a miner that
+     * connected and vanished killed the process with SIGPIPE on the first
+     * write to it. */
+    signal(SIGPIPE, SIG_IGN);
     const char *cfg_path = "./proxy.conf";
     if (argc > 1) {
         if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
@@ -648,11 +1268,21 @@ int main(int argc, char **argv) {
     /* The ping is a getblockchaininfo sanity check. Some block-template
      * backends that accept unauthenticated JSON-RPC don't implement it, so
      * skip the ping when no credentials are configured — the initial
-     * getblocktemplate below still validates connectivity. */
+     * getblocktemplate below still validates connectivity.
+     *
+     * It goes through the long-poll client, not the 10s general-purpose one:
+     * on a backend without getblockchaininfo (the CUSF enforcer) the ping
+     * falls back to a full getblocktemplate, and that response is a multi-MB
+     * template that takes longer than 10s once the mempool fills (10.5–13.5s
+     * measured live on alphanet). With the short client the pool exits 3 at
+     * startup — "bitcoind ping failed: curl: Timeout was reached" — and a
+     * relaunch loop just flaps until a template happens to come back fast.
+     * The tip watcher already fetches every template with this client. */
     if (cfg.bitcoind_user[0] != '\0' || cfg.bitcoind_pass[0] != '\0') {
-        if (bitcoind_ping(&btc, err, sizeof err) < 0) {
+        if (bitcoind_ping(&btc_lp, err, sizeof err) < 0) {
             fprintf(stderr, "bitcoind ping failed: %s\n", err);
             bitcoind_client_free(&btc);
+            bitcoind_client_free(&btc_lp);
             return 3;
         }
         LOG_INFO("bitcoind ping ok");
@@ -675,6 +1305,92 @@ int main(int argc, char **argv) {
         return 4;
     }
 
+    /* Pool identity into the DB, before anything else can read the table.
+     * The dashboard shows this to miners; see store.h for why it lives in
+     * the DB rather than in the dashboard's own environment. */
+    {
+        char network[32] = {0}, network_src[16] = {0};
+        resolve_network(&btc, &cfg, network, sizeof network,
+                        network_src, sizeof network_src);
+        const int pps = strcmp(cfg.pool_mode, "pps-classic") == 0;
+        LOG_INFO("pool identity: network=%s (%s) mode=%s fee=%d bps tag=\"%s\" "
+                 "operator=%s%s%s",
+                 network, network_src, cfg.pool_mode, cfg.fee_bps,
+                 cfg.coinbase_tag, cfg.operator_address,
+                 pps ? " pool_btc=" : "", pps ? cfg.pool_btc_address : "");
+        /* Say the policy out loud on every start, next to the rest of the
+         * identity rather than down by the stratum config -- this is a
+         * configured fact, not a template one, and printing it here means it
+         * survives a node that is not answering yet. An operator who never
+         * saw it stated cannot disclose it to the miners it costs. */
+        if (strcmp(cfg.pool_mode, "pplns-coinbase") == 0) {
+            LOG_INFO("pplns-coinbase: payout floor %lld sats — a miner whose "
+                     "share of a block is worth less than that is NOT PAID BY "
+                     "THAT BLOCK. The amount goes to the other miners in the "
+                     "same window, never to the operator, and the miner moves "
+                     "to the front of the payout queue for a later block. It "
+                     "is a rotation, not a balance: the pool holds nothing "
+                     "against it and no payment settles later. The dashboard "
+                     "states this to miners; publish it on your pool page "
+                     "too.", (long long)cfg.pplns_payout_floor_sats);
+        }
+        /* Publish the ports so the dashboard can tell a miner which one to
+         * dial. Labels are constrained to [A-Za-z0-9_-] at config parse time,
+         * so this needs no escaping. */
+        /* Sized for STRATUM_MAX_LISTENERS + the default at their widest: a
+         * 31-char label and three %.10g doubles is ~150 bytes an entry. It fits
+         * with room to spare, and the check below means a future limit that
+         * outgrows it says so instead of quietly publishing a shorter list
+         * than the pool actually serves. */
+        char lj[4096];
+        size_t lo = 0;
+        int dropped = 0;
+        /* promised_min_diff is published alongside min_diff because the two
+         * now behave differently and the dashboard has to be able to tell
+         * them apart: min_diff is the rate-loop bound, which the network
+         * difficulty still overrides, while promised_min_diff is kept even
+         * when the chain is easier. A port over the chain on the first is
+         * quietly served less than it asked for; a port over the chain on
+         * the second gets what it asked for and discards blocks paying for
+         * it. Those are opposite findings and need opposite advice.
+         *
+         * listen_port never promises one. */
+        lo += (size_t)snprintf(lj + lo, sizeof lj - lo,
+                               "[{\"port\":%d,\"label\":\"\",\"min_diff\":%.10g,"
+                               "\"promised_min_diff\":0,\"initial_diff\":%.10g}",
+                               cfg.listen_port, cfg.vardiff_min,
+                               cfg.initial_diff);
+        for (int i = 0; i < cfg.listener_count; ++i) {
+            const stratum_listener_t *l = &cfg.listeners[i];
+            char one[256];
+            int n = snprintf(one, sizeof one,
+                             ",{\"port\":%d,\"label\":\"%s\","
+                             "\"min_diff\":%.10g,\"promised_min_diff\":%.10g,"
+                             "\"initial_diff\":%.10g}",
+                             l->port, l->label,
+                             l->vardiff_min > 0 ? l->vardiff_min : cfg.vardiff_min,
+                             l->min_diff,
+                             l->initial_diff > 0 ? l->initial_diff : cfg.initial_diff);
+            if (n < 0 || lo + (size_t)n >= sizeof lj - 2) { dropped++; continue; }
+            memcpy(lj + lo, one, (size_t)n);
+            lo += (size_t)n;
+        }
+        lj[lo++] = ']';
+        lj[lo] = '\0';
+        if (dropped) {
+            LOG_WARN("pool identity: %d listener(s) did not fit the published "
+                     "port list — the dashboard will not show them", dropped);
+        }
+        /* -1 means "this mode has no payout floor", which is every mode but
+         * pplns-coinbase. Only there can a miner mine and be paid nothing,
+         * and only there does the dashboard have something to disclose. */
+        store_record_pool_identity(store, network, network_src,
+                                   cfg.coinbase_tag, cfg.operator_address,
+                                   pps ? cfg.pool_btc_address : NULL, lj,
+                                   strcmp(cfg.pool_mode, "pplns-coinbase") == 0
+                                       ? cfg.pplns_payout_floor_sats : -1);
+    }
+
     /* Broadcast (optional). */
     broadcast_cfg_t bcfg2 = {0};
     snprintf(bcfg2.url, sizeof bcfg2.url, "%s", cfg.redis_url);
@@ -686,9 +1402,11 @@ int main(int argc, char **argv) {
         bcast = NULL;
     }
 
-    /* Initial template + job. */
+    /* Initial template + job. Same client as the ping and the tip watcher:
+     * a live template can take longer than the 10s general-purpose client
+     * allows (see the ping above), and exiting 5 here is the same flap. */
     bitcoind_template_t *tmpl = NULL;
-    if (bitcoind_get_block_template(&btc, &tmpl, err, sizeof err) < 0) {
+    if (bitcoind_get_block_template(&btc_lp, &tmpl, err, sizeof err) < 0) {
         fprintf(stderr, "initial GBT failed: %s\n", err);
         store_close(store);
         bitcoind_client_free(&btc);
@@ -730,6 +1448,35 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Classify whatever is already on record, once, before serving.
+     *
+     * Rows written before blocks_found had a status are all 'pending', which
+     * counts as nothing — correct, but useless. The templates table is a log
+     * of the tips this pool observed, so one bulk SQL pass settles every
+     * candidate whose next height was ever seen, with no RPC and no reliance
+     * on a backend that may serve only two methods. What it cannot reach
+     * stays pending.
+     *
+     * Then, and only then, the UNIQUE index on hash: it fails outright on a
+     * table that still holds duplicates, which is why it is not a migration —
+     * the migration runner would swallow that failure as a warning and leave
+     * the index missing on exactly the databases that needed it. */
+    {
+        int confirmed = 0, orphaned = 0, pending = 0;
+        if (store_reconcile_blocks_from_templates(store, tmpl->height - 1,
+                                                  &confirmed, &orphaned,
+                                                  &pending) == 0) {
+            LOG_INFO("blocks on record: confirmed=%d orphaned=%d pending=%d",
+                     confirmed, orphaned, pending);
+            if (pending > 0) {
+                LOG_INFO("%d block candidate(s) could not be verified from "
+                         "observed tips and count as nothing until they are",
+                         pending);
+            }
+        }
+        store_finalize_block_hash_index(store);
+    }
+
     /* Seed the rate before any share can arrive — a share credited at 0
      * would be silently unpaid. */
     refresh_pps_rate(&sctx, tmpl);
@@ -740,6 +1487,7 @@ int main(int argc, char **argv) {
     snprintf(stcfg.bind_addr, sizeof stcfg.bind_addr, "%s", cfg.listen_addr);
     stcfg.bind_port    = cfg.listen_port;
     stcfg.max_conns    = cfg.max_conns;
+    stcfg.max_suggested_diff = cfg.max_suggested_diff;
     stcfg.initial_diff = cfg.initial_diff;
     snprintf(stcfg.operator_address, sizeof stcfg.operator_address, "%s",
              cfg.operator_address);
@@ -751,15 +1499,43 @@ int main(int argc, char **argv) {
     stcfg.vardiff_min        = cfg.vardiff_min;
     stcfg.vardiff_max        = cfg.vardiff_max;
     stcfg.vardiff_window_sec = cfg.vardiff_window_sec;
+    stcfg.vardiff_min_samples     = cfg.vardiff_min_samples;
+    stcfg.vardiff_max_window_mult = cfg.vardiff_max_window_mult;
+    stcfg.vardiff_idle_step       = cfg.vardiff_idle_step;
     stcfg.idle_timeout_sec   = cfg.idle_timeout_sec;
+    stcfg.idle_timeout_authorized_sec = cfg.idle_timeout_authorized_sec;
+    stcfg.max_submits_per_sec = cfg.max_submits_per_sec;
+    stcfg.auth_max_failures     = cfg.auth_max_failures;
+    stcfg.auth_fail_lockout_sec = cfg.auth_fail_lockout_sec;
+    stcfg.listener_count     = cfg.listener_count;
+    for (int i = 0; i < cfg.listener_count; ++i) {
+        stcfg.listeners[i] = cfg.listeners[i];
+    }
 
-    /* PPS. pool_mode=pps-classic takes Thunder-address usernames, pays every
-     * coinbase into the pool's BTC wallet, and accrues per-share credits. */
-    stcfg.pps_enabled = (strcmp(cfg.pool_mode, "pps-classic") == 0);
+    /* Which of the two things pool_mode decides applies here. See
+     * stratum.h — pplns-btc is the mode that makes them independent: it
+     * pools the reward (coinbase pays the pool) but pays out on L1 (the
+     * username is a Bitcoin address). */
+    int mode_pps_classic   = strcmp(cfg.pool_mode, "pps-classic")   == 0;
+    int mode_pplns_thunder = strcmp(cfg.pool_mode, "pplns-thunder") == 0;
+    int mode_pplns_btc     = strcmp(cfg.pool_mode, "pplns-btc")     == 0;
+    /* Same accounting, no custody: the coinbase pays the window directly. */
+    int mode_pplns_cb      = strcmp(cfg.pool_mode, "pplns-coinbase") == 0;
+
+    stcfg.pps_accrues         = mode_pps_classic;
+    /* Mutually exclusive by construction: the reward goes to the miners or
+     * to the pool, never both. */
+    stcfg.coinbase_pays_pool   = mode_pps_classic ||
+                                 mode_pplns_thunder || mode_pplns_btc;
+    stcfg.coinbase_pays_window = mode_pplns_cb;
+    stcfg.on_window_fractions  = mode_pplns_cb ? on_window_fractions_cb : NULL;
+    stcfg.max_coinbase_bytes   = (size_t)cfg.coinbase_max_bytes;
+    stcfg.payout_floor_sats    = cfg.pplns_payout_floor_sats;
+    stcfg.username_is_thunder = mode_pps_classic || mode_pplns_thunder;
     snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",
              cfg.pool_btc_address);
 
-    if (stcfg.pps_enabled) {
+    if (stcfg.coinbase_pays_pool) {
         /* Fail fast on a misconfigured pool_btc_address so we don't drop
          * every rendered job at runtime. */
         uint8_t spk[64];
@@ -780,6 +1556,10 @@ int main(int argc, char **argv) {
     stcfg.on_reject      = on_reject_cb;
     stcfg.on_block       = on_block_cb;
     stcfg.on_block_found = on_block_found_cb;
+    /* Let the server see the accrual gate so it can refuse work the pool has
+     * decided not to pay for. */
+    stcfg.pps_gate = &sctx.pps_gated;
+    stcfg.pps_refuse_shares_below_min = cfg.pps_refuse_shares_below_min;
 
     stratum_server_t *srv = NULL;
     if (stratum_server_start(&stcfg, &srv) < 0) {
@@ -792,10 +1572,116 @@ int main(int argc, char **argv) {
         return 7;
     }
     sctx.srv = srv;
-    stratum_server_set_job(srv, initial_job);
+    /* First job of the process: nobody is connected yet, so the flag reaches
+     * no one, but a new tip is what it describes.
+     *
+     * Under pplns-coinbase it carries the window like every other job. This
+     * used to be skipped on the premise that a process which has just started
+     * has no shares to pay and no difficulty to size a window with. Neither
+     * holds on a RESTART: the shares table persists, and refresh_pps_rate()
+     * above has already read the difficulty out of this same template. The
+     * tip watcher only rebuilds on a new tip or after its 30-second refresh,
+     * so a windowless first job stood for up to 30 seconds after every
+     * restart, and a block found in that gap paid its finder alone -- the
+     * whole window skipped, and nothing staged in the payout queue to say so.
+     *
+     * The bootstrap case is unchanged and now lives in one place: a pool with
+     * no shares yet gets a job with no window from attach_pplns_window(),
+     * which says so, and conn_render_coinbase() pays the finder from it. A
+     * template that cannot carry a window is not published, on the same rule
+     * the tip watcher applies; the watcher rebuilds on its first poll and the
+     * pool starts serving work from the first template that can. */
+    if (strcmp(cfg.pool_mode, "pplns-coinbase") == 0) {
+        double nd = atomic_load_explicit(&sctx.net_difficulty,
+                                         memory_order_relaxed);
+        if (attach_pplns_window(store, &cfg, nd, tmpl, initial_job) != 0) {
+            LOG_WARN("pplns-coinbase: the first template cannot carry a "
+                     "window, so no job is published from it; the tip "
+                     "watcher retries on its next poll");
+            stratum_job_free(initial_job);
+            initial_job = NULL;
+            /* Make the watcher's first poll a rebuild rather than a 30-second
+             * wait: last_built_ms is what the periodic refresh keys on. */
+            pthread_mutex_lock(&sctx.lock);
+            sctx.last_built_ms = 0;
+            pthread_mutex_unlock(&sctx.lock);
+        }
+    }
+    if (initial_job) stratum_server_set_job(srv, initial_job, 1);
+
+    /* A port's promised floor and the chain can disagree, and the floor wins
+     * (see clamp_assigned_difficulty). When it does, every miner on that port
+     * filters locally at a target harder than the network's, so it discards
+     * blocks it solved rather than sending them — roughly (floor / network
+     * difficulty) of them. That is the deliberate price of being reachable by
+     * a rented fleet, and it is confined to the ports that asked for it, but
+     * it is not a price to pay silently.
+     *
+     * The dashboard health check reports the same mismatch. This says it at
+     * startup as well, because the operator who just changed the config is
+     * looking at the log, not the dashboard. */
+    if (cfg.listener_count > 0) {
+        uint8_t net_target_be[32] = {0};
+        if (tmpl->target_hex[0] != '\0' && strlen(tmpl->target_hex) == 64) {
+            if (hex_to_bytes_display(tmpl->target_hex, net_target_be, 32) < 0)
+                nbits_to_target(tmpl->bits, net_target_be);
+        } else {
+            nbits_to_target(tmpl->bits, net_target_be);
+        }
+        double net_diff = target_to_diff(net_target_be);
+        for (int i = 0; i < cfg.listener_count; ++i) {
+            double floor_diff = cfg.listeners[i].min_diff;
+            if (floor_diff <= 0.0 || net_diff <= 0.0) continue;
+            if (floor_diff <= net_diff) continue;
+            char who[64];
+            if (cfg.listeners[i].label[0]) {
+                snprintf(who, sizeof who, "%d (%s)",
+                         cfg.listeners[i].port, cfg.listeners[i].label);
+            } else {
+                snprintf(who, sizeof who, "%d", cfg.listeners[i].port);
+            }
+            /* %g for both difficulties (see config.c): %.0f/%.2f collapse a
+             * forknet's 4.66e-10 to "0.00" and the port's 1e-8 to "0", which
+             * turns the one message that has to name two numbers into one
+             * that names neither. The ratios below keep %.0f — the floor is
+             * above the chain by construction, so those really are >= 1. */
+            LOG_WARN("listener port %s promises min_diff %g, above this "
+                     "chain's network difficulty %g. That floor is kept — a "
+                     "marketplace measures the difficulty on the wire — so "
+                     "miners on this port will discard roughly %.0f of every "
+                     "%.0f blocks they solve, because they filter locally at "
+                     "the difficulty the pool assigns. Drop min_diff on this "
+                     "port if keeping every block matters more than serving "
+                     "rented hashrate on it.",
+                     who, floor_diff, net_diff,
+                     floor_diff / net_diff - 1.0, floor_diff / net_diff);
+        }
+    }
     bitcoind_template_free(tmpl);
 
-    LOG_INFO("stratum listening on %s:%d", cfg.listen_addr, cfg.listen_port);
+    /* The one thing pplns-btc needs that no other mode does, said at
+     * startup rather than discovered when the first payout fails 100 blocks
+     * later. The proxy cannot check it: the wallet belongs to the enforcer
+     * and the payout worker is a separate process. */
+    if (strcmp(cfg.pool_mode, "pplns-btc") == 0) {
+        LOG_INFO("pplns-btc: miners are paid on L1. This requires "
+                 "bip300301_enforcer running with --enable-wallet, "
+                 "pool_btc_address (%s) being an address from that wallet, "
+                 "and the payout worker started with PAYOUT_RAIL=btc. The "
+                 "pool holds no keys — the enforcer signs and broadcasts.",
+                 cfg.pool_btc_address);
+    }
+
+    LOG_INFO("stratum listening on %s:%d (difficulty from %g)",
+             cfg.listen_addr, cfg.listen_port, cfg.initial_diff);
+    for (int i = 0; i < cfg.listener_count; ++i) {
+        const stratum_listener_t *l = &cfg.listeners[i];
+        LOG_INFO("stratum listening on %s:%d%s%s (difficulty from %g, floor %g)",
+                 cfg.listen_addr, l->port,
+                 l->label[0] ? " — " : "", l->label[0] ? l->label : "",
+                 l->initial_diff > 0 ? l->initial_diff : cfg.initial_diff,
+                 l->vardiff_min > 0 ? l->vardiff_min : cfg.vardiff_min);
+    }
 
     /* Signals. */
     struct sigaction sa;
@@ -803,7 +1689,6 @@ int main(int argc, char **argv) {
     sa.sa_handler = on_signal;
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN);
 
     /* Tip watcher thread. */
     pthread_t watcher;

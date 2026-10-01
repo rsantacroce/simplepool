@@ -39,5 +39,62 @@ export const fmtPct = (p) => {
     return p.toPrecision(2) + '%';
 };
 
+/* Network difficulty, at whatever scale this chain happens to run at.
+ *
+ * The range is the whole problem: mainnet is ~1.3e14 and a forknet can sit
+ * at 4.66e-10, and one format cannot serve both — toFixed(2) renders the
+ * forknet as "0.00", and a raw 126980000000000 is unreadable at a glance.
+ * So: SI suffix above a thousand, plain decimals down to 1, and significant
+ * figures below it, which is the only form that survives a chain running
+ * ten orders of magnitude under difficulty 1. The exact value always goes
+ * in a title attribute next to it — this is the readable form, not the
+ * authoritative one. */
+export const fmtDifficulty = (d) => {
+    const n = Number(d);
+    if (!isFinite(n) || n <= 0) return '—';
+    const units = [[1e18, 'E'], [1e15, 'P'], [1e12, 'T'],
+                   [1e9, 'G'], [1e6, 'M'], [1e3, 'k']];
+    for (const [scale, suffix] of units) {
+        if (n >= scale) return (n / scale).toFixed(2) + ' ' + suffix;
+    }
+    if (n >= 1) return n.toFixed(2);
+    return n.toPrecision(3);
+};
+
+/* The verdict on a block candidate, as a small piece of HTML.
+ *
+ * Never render a candidate's status as blank or absent. A row in blocks_found
+ * is a candidate until something verifies it, and a page that quietly shows
+ * all of them as blocks is exactly how a pool that had mined nothing appeared
+ * to have mined thousands. `pending` is not a transient — against a backend
+ * that serves only getblocktemplate and submitblock there may be nothing able
+ * to verify a block for a while — so it gets its own honest wording rather
+ * than being rounded up to "found".
+ *
+ * Escapes the status before interpolating: it comes from the DB, and this is
+ * emitted unescaped by the views. */
+export const blockStatus = (b) => {
+    const raw = (b && b.status) || 'pending';
+    const st = String(raw).replace(/[^a-z]/gi, '').toLowerCase();
+    const confs = Number((b && b.confirmations) || 0);
+    if (st === 'confirmed') {
+        const via = b && b.checked_via === 'tips' ? ' (from observed tips)' : '';
+        return `<span class="blk-ok" title="in the chain${via}">in chain${
+            confs > 0 ? ' · ' + fmtN(confs) + ' conf' : ''}</span>`;
+    }
+    if (st === 'orphaned') {
+        return '<span class="blk-bad" title="was submitted, but the chain went' +
+               ' another way — it pays nothing">orphaned</span>';
+    }
+    if (st === 'rejected') {
+        const why = b && b.submit_error ? String(b.submit_error) : '';
+        return `<span class="blk-bad" title="the node refused this block${
+            why ? ': ' + why.replace(/[<>&"]/g, '') : ''}">rejected</span>`;
+    }
+    return '<span class="muted" title="submitted and accepted, but not yet' +
+           ' verified to be in the chain — counts as nothing until it is">' +
+           'unverified</span>';
+};
+
 /* Convenience bundle for res.locals middleware. */
-export const all = { fmtN, fmtF, fmtTs, ago, fmtSats, fmtPct };
+export const all = { fmtN, fmtF, fmtTs, ago, fmtSats, fmtPct, fmtDifficulty, blockStatus };

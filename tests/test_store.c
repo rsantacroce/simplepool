@@ -13,10 +13,17 @@
 #include <time.h>
 #include <unistd.h>
 
-static char g_db_paths[16][256];
+/* One slot per fresh_db_path() call. Overrunning this array does not fail
+ * visibly -- it writes a path past the end and the next store_open() fails for
+ * no stated reason, which is how a 17th test spent its first run looking like a
+ * store bug. The assert turns the next overrun into an immediate, named
+ * failure; the count is deliberately well clear of the current call sites. */
+#define MAX_TEST_DBS 48
+static char g_db_paths[MAX_TEST_DBS][256];
 static int  g_db_count = 0;
 
 static const char *fresh_db_path(void) {
+    assert(g_db_count < MAX_TEST_DBS && "MAX_TEST_DBS too small - raise it");
     char *p = g_db_paths[g_db_count++];
     snprintf(p, 256, "/tmp/store_test_%d_%d.db", (int)getpid(), g_db_count);
     unlink(p);
@@ -51,6 +58,22 @@ static int64_t scalar_i64(sqlite3 *db, const char *sql) {
     return v;
 }
 
+/* Copies into `out` because the sqlite3_stmt is finalized before returning.
+ * Writes "" for SQL NULL, and returns whether the column was non-NULL — the
+ * identity test needs to tell "stored blank" from "stored nothing". */
+static int scalar_text(sqlite3 *db, const char *sql, char *out, size_t cap) {
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(st);
+    assert(rc == SQLITE_ROW);
+    int is_null = sqlite3_column_type(st, 0) == SQLITE_NULL;
+    const unsigned char *v = sqlite3_column_text(st, 0);
+    snprintf(out, cap, "%s", (is_null || !v) ? "" : (const char *)v);
+    sqlite3_finalize(st);
+    return !is_null;
+}
+
 static double scalar_dbl(sqlite3 *db, const char *sql) {
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
@@ -60,6 +83,194 @@ static double scalar_dbl(sqlite3 *db, const char *sql) {
     double v = sqlite3_column_double(st, 0);
     sqlite3_finalize(st);
     return v;
+}
+
+/* An existing database must survive the upgrade that adds blocks_found.status.
+ *
+ * Every other test here starts from an empty file, so store_open() only ever
+ * runs against a database it just created -- where CREATE TABLE already names
+ * every current column. A deployed pool is the opposite case: the table exists
+ * from an older schema and the new columns arrive only through MIGRATIONS_SQL.
+ * Nothing exercised that path, so a statement in the strict schema section that
+ * depends on a migrated column passes the whole suite and still fails to open a
+ * real database.
+ *
+ * The old CREATE TABLE is written out literally rather than derived from the
+ * current source, so this keeps testing the upgrade when the schema changes
+ * again. */
+static void test_open_upgrades_a_pre_status_database(void) {
+    const char *path = fresh_db_path();
+
+    sqlite3 *raw = NULL;
+    assert(sqlite3_open(path, &raw) == SQLITE_OK);
+    assert(sqlite3_exec(raw,
+        "CREATE TABLE blocks_found ("
+        "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  ts              INTEGER NOT NULL,"
+        "  height          INTEGER NOT NULL,"
+        "  hash            TEXT NOT NULL,"
+        "  finder_id       INTEGER,"
+        "  finder_address  TEXT,"
+        "  reward_sats     INTEGER,"
+        "  fee_sats        INTEGER"
+        ");"
+        "INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats)"
+        "  VALUES (1000, 900001, 'deadbeef', 312000000, 780000);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(raw);
+
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* ...and the upgrade must have happened, not merely not-crashed. */
+    sqlite3 *chk = NULL;
+    assert(sqlite3_open(path, &chk) == SQLITE_OK);
+    int has_status = 0, has_index = 0, rows = 0;
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(chk, "PRAGMA table_info(blocks_found)", -1, &st, NULL) == SQLITE_OK);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *n = (const char *)sqlite3_column_text(st, 1);
+        if (n && strcmp(n, "status") == 0) has_status = 1;
+    }
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(chk, "PRAGMA index_list(blocks_found)", -1, &st, NULL) == SQLITE_OK);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *n = (const char *)sqlite3_column_text(st, 1);
+        if (n && strcmp(n, "blocks_found_status_idx") == 0) has_index = 1;
+    }
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(chk, "SELECT COUNT(*) FROM blocks_found", -1, &st, NULL) == SQLITE_OK);
+    if (sqlite3_step(st) == SQLITE_ROW) rows = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(chk);
+
+    assert(has_status && "migration must add blocks_found.status");
+    assert(has_index  && "migration must create blocks_found_status_idx");
+    assert(rows == 1  && "the pre-existing block row must survive");
+
+    store_close(s);
+    printf("  ok test_open_upgrades_a_pre_status_database\n");
+}
+
+/* schema.sql and the schema store.c creates must describe the same database.
+ *
+ * Both are real initialisation paths, not one canonical source and one copy.
+ * scripts/deploy-to-server.sh seeds data/shares.db from schema.sql, so does
+ * tests/test_payout_regtest.sh, the dashboard tests build their fixtures from
+ * it, and INSTALL.md and README.md both tell operators to. store.c builds the
+ * other one, for a pool that starts with no database at all.
+ *
+ * They drift silently. A column added to store.c's CREATE and its migrations
+ * but not to schema.sql leaves a deploy-seeded pool with a table the proxy
+ * only repairs on its next start -- and any tool reading that database before
+ * then, or never opening it through store.c at all, sees the old shape. That
+ * is exactly what happened to the two pplns columns.
+ *
+ * Comparing the column sets rather than the DDL text keeps this from failing
+ * on formatting, comments, or constraints the two express differently, while
+ * still catching the thing that actually breaks: a column on one side and not
+ * the other. */
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* "table:col,col;table:col,col;" with tables and columns both sorted, so the
+ * comparison does not depend on declaration order. */
+static void canonical_schema(sqlite3 *db, char *out, size_t cap) {
+    out[0] = '\0';
+    size_t used = 0;
+    sqlite3_stmt *tq = NULL;
+    assert(sqlite3_prepare_v2(db,
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "  AND name NOT LIKE 'sqlite_%' ORDER BY name", -1, &tq, NULL) == SQLITE_OK);
+    while (sqlite3_step(tq) == SQLITE_ROW) {
+        const char *tbl = (const char *)sqlite3_column_text(tq, 0);
+        if (!tbl) continue;
+        char cols[64][64];
+        char *colp[64];
+        int nc = 0;
+        char q[256];
+        snprintf(q, sizeof q, "PRAGMA table_info(%s)", tbl);
+        sqlite3_stmt *cq = NULL;
+        assert(sqlite3_prepare_v2(db, q, -1, &cq, NULL) == SQLITE_OK);
+        while (nc < 64 && sqlite3_step(cq) == SQLITE_ROW) {
+            const char *cn = (const char *)sqlite3_column_text(cq, 1);
+            if (!cn) continue;
+            snprintf(cols[nc], sizeof cols[nc], "%s", cn);
+            colp[nc] = cols[nc];
+            nc++;
+        }
+        sqlite3_finalize(cq);
+        qsort(colp, (size_t)nc, sizeof colp[0], cmp_str);
+        used += (size_t)snprintf(out + used, cap - used, "%s:", tbl);
+        for (int i = 0; i < nc && used < cap; ++i)
+            used += (size_t)snprintf(out + used, cap - used, "%s%s",
+                                     colp[i], i + 1 < nc ? "," : "");
+        if (used < cap) used += (size_t)snprintf(out + used, cap - used, ";\n");
+    }
+    sqlite3_finalize(tq);
+}
+
+static void test_schema_sql_matches_store_schema(void) {
+    /* make runs the suites from the repo root; try one level up too so a
+     * direct ./build/test_store from tests/ still works. Never silently skip:
+     * a skipped parity check is how the drift got here in the first place. */
+    const char *candidates[] = { "schema.sql", "../schema.sql" };
+    FILE *f = NULL;
+    for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; ++i) {
+        f = fopen(candidates[i], "rb");
+        if (f) break;
+    }
+    assert(f && "schema.sql not found - run the suite from the repo root");
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    assert(len > 0);
+    char *sql = malloc((size_t)len + 1);
+    assert(sql);
+    assert(fread(sql, 1, (size_t)len, f) == (size_t)len);
+    sql[len] = '\0';
+    fclose(f);
+
+    /* One database from schema.sql... */
+    const char *path_a = fresh_db_path();
+    sqlite3 *a = NULL;
+    assert(sqlite3_open(path_a, &a) == SQLITE_OK);
+    char *errm = NULL;
+    int rc = sqlite3_exec(a, sql, NULL, NULL, &errm);
+    assert(rc == SQLITE_OK && "schema.sql must apply cleanly");
+    sqlite3_free(errm);
+    free(sql);
+
+    /* ...and one from store_open, which is what a fresh pool gets. */
+    const char *path_b = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path_b);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    sqlite3 *b = NULL;
+    assert(sqlite3_open(path_b, &b) == SQLITE_OK);
+
+    char sa[8192], sb[8192];
+    canonical_schema(a, sa, sizeof sa);
+    canonical_schema(b, sb, sizeof sb);
+    if (strcmp(sa, sb) != 0) {
+        fprintf(stderr, "schema.sql and store.c disagree.\n"
+                        "--- schema.sql ---\n%s\n--- store.c ---\n%s\n", sa, sb);
+    }
+    assert(strcmp(sa, sb) == 0 &&
+           "schema.sql and store.c must create the same columns");
+
+    sqlite3_close(a);
+    sqlite3_close(b);
+    store_close(s);
+    printf("  ok test_schema_sql_matches_store_schema\n");
 }
 
 static void test_basic(void) {
@@ -100,7 +311,8 @@ static void test_basic(void) {
 
     /* Block path */
     rc = store_record_block(s, 9999, 12345, "abc123hash", "worker3",
-                            "bcrt1qexampleaddr", 4950000000LL, 50000000LL);
+                            "bcrt1qexampleaddr", 4950000000LL, 50000000LL,
+                            STORE_BLOCK_PENDING, NULL, 0.0);
     assert(rc == 0);
     rc = store_flush(s);
     assert(rc == 0);
@@ -342,6 +554,78 @@ static void test_credited_sats(void) {
     sqlite3_close(db);
     store_close(s);
     printf("  ok test_credited_sats\n");
+}
+
+/* Pool identity: written once at startup, and the only source the dashboard
+ * has for what this pool is. Two properties matter beyond the round trip.
+ *
+ * First, it must not collide with the per-template pool_meta write — they
+ * share the id=1 row and run in either order, so each must leave the other's
+ * columns alone, including the write-once credited_from stamp.
+ *
+ * Second, solo mode must store pool_btc_address as NULL rather than "", so a
+ * reader can tell "no pool wallet in this mode" from "operator configured a
+ * blank one". */
+static void test_pool_identity(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Identity first, template second — the startup order. */
+    assert(store_record_pool_identity(s, "signet", "node", "/simplepool/",
+                                      "tb1qoperator", "tb1qpoolwallet",
+                                      "[{\"port\":3334,\"label\":\"\","
+                                      "\"min_diff\":1,\"initial_diff\":1}]",
+                                      -1) == 0);
+    assert(store_record_pool_meta(s, "pps-classic", 100, "derived",
+                                  2783.22, 2811.33, 100.4,
+                                  111157.455, 312500000, 1700000000ULL) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+
+    char buf[128];
+    assert(scalar_i64(db, "SELECT count(*) FROM pool_meta") == 1);
+    scalar_text(db, "SELECT network FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "signet") == 0);
+    scalar_text(db, "SELECT network_source FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "node") == 0);
+    scalar_text(db, "SELECT coinbase_tag FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "/simplepool/") == 0);
+    scalar_text(db, "SELECT operator_address FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "tb1qoperator") == 0);
+    scalar_text(db, "SELECT pool_btc_address FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "tb1qpoolwallet") == 0);
+
+    /* The template write must not have disturbed identity, and identity must
+     * not have pre-empted the write-once credited_from stamp. */
+    assert(scalar_i64(db, "SELECT fee_bps FROM pool_meta") == 100);
+    assert(scalar_i64(db, "SELECT credited_from FROM pool_meta") == 1700000000);
+
+    /* updated_at means "when the rate was last refreshed". Identity is
+     * written once at startup, so re-writing it must not touch that — else a
+     * stalled template path would keep looking alive. */
+    int64_t seen = scalar_i64(db, "SELECT updated_at FROM pool_meta");
+    assert(store_record_pool_identity(s, "regtest", "inferred", "/other/",
+                                      "bcrt1qop", NULL, NULL, -1) == 0);
+    assert(scalar_i64(db, "SELECT updated_at FROM pool_meta") == seen);
+
+    /* Solo mode: NULL, not "". */
+    assert(scalar_text(db, "SELECT pool_btc_address FROM pool_meta",
+                       buf, sizeof buf) == 0);
+    scalar_text(db, "SELECT network FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "regtest") == 0);
+    /* And still no collateral damage to the rate half. */
+    assert(scalar_i64(db, "SELECT credited_from FROM pool_meta") == 1700000000);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pool_identity\n");
 }
 
 /* rate_history is the provenance half of the audit: it must append when the
@@ -608,6 +892,1156 @@ static void test_template_retention(void) {
     printf("  ok test_template_retention\n");
 }
 
+/* Block-candidate accounting. A share meeting network difficulty is only a
+ * candidate: submitblock refuses stale, duplicate and high-hash ones
+ * routinely, and on a low-difficulty chain that is nearly all of them. Every
+ * row used to be written as a found block with its full reward, which is what
+ * disabled the solvency check — it sums reward_sats across the table. */
+static void test_block_candidate_status(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    int rc = store_open(&cfg, &s);
+    assert(rc == 0);
+
+    /* Accepted by the node: recorded, but only as pending. Nothing on the
+     * submit path is allowed to claim a block is in the chain. */
+    rc = store_record_block(s, 1000, 800001, "hash_accepted", "w1",
+                            "bcrt1qaddr", 5000000000LL, 0,
+                            STORE_BLOCK_PENDING, NULL, 0.0);
+    assert(rc == 0);
+
+    /* Refused by the node: recorded so the refusal is visible, but as
+     * 'rejected' — never counted, and carrying the node's reason. */
+    rc = store_record_block(s, 1001, 800001, "hash_rejected", "w1",
+                            "bcrt1qaddr", 5000000000LL, 0,
+                            STORE_BLOCK_REJECTED, "inconclusive", 0.0);
+    assert(rc == 0);
+
+    /* A coinbase height of zero cannot exist. Refused outright rather than
+     * filed at a height no chain has. */
+    rc = store_record_block(s, 1002, 0, "hash_zero_height", "w1",
+                            "bcrt1qaddr", 5000000000LL, 0,
+                            STORE_BLOCK_PENDING, NULL, 0.0);
+    assert(rc != 0);
+
+    rc = store_flush(s);
+    assert(rc == 0);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    assert(rc == SQLITE_OK);
+
+    assert(scalar_i64(db, "SELECT count(*) FROM blocks_found") == 2);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='hash_zero_height'") == 0);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE status='pending'") == 1);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE status='rejected'") == 1);
+    /* Nothing may be born confirmed. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE status='confirmed'") == 0);
+
+    char err[128] = {0};
+    int had = scalar_text(db,
+        "SELECT submit_error FROM blocks_found WHERE hash='hash_rejected'",
+        err, sizeof err);
+    assert(had && strcmp(err, "inconclusive") == 0);
+    /* An accepted candidate has no error to carry. */
+    had = scalar_text(db,
+        "SELECT submit_error FROM blocks_found WHERE hash='hash_accepted'",
+        err, sizeof err);
+    assert(!had);
+
+    /* This is the number the solvency check would sum. A rejected candidate
+     * must contribute nothing to it. */
+    assert(scalar_i64(db,
+        "SELECT COALESCE(SUM(reward_sats),0) FROM blocks_found "
+        "WHERE status='confirmed'") == 0);
+
+    /* The stats counter follows the same rule: refused candidates are not
+     * blocks, so the shutdown line does not report them as such. */
+    store_stats_t st = {0};
+    store_get_stats(s, &st);
+    assert(st.blocks_committed == 1);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_block_candidate_status\n");
+}
+
+/* Reconciliation against the observed chain of tips, which is the only path
+ * available when the backend serves nothing but getblocktemplate and
+ * submitblock — the CUSF enforcer a drivechain pool must point at.
+ *
+ * A template building height H+1 with prev_hash X is the node saying its tip
+ * at H was X. So a candidate at H is the chain's iff the newest observation
+ * at H+1 names it. */
+static void test_reconcile_from_templates(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Two competing candidates at the same height — expected on a
+     * low-difficulty chain, and both rows must survive. */
+    assert(store_record_block(s, 1000, 800001, "hash_win", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
+    assert(store_record_block(s, 1001, 800001, "hash_lose", "w2", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
+    /* A candidate whose next height was never observed. Unverifiable, so it
+     * must stay pending — and pending is never revenue. */
+    assert(store_record_block(s, 1002, 800004, "hash_unseen", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
+    assert(store_flush(s) == 0);
+
+    store_template_t t = {
+        .ts_s = 2000, .height = 800002, .prev_hash = "hash_win",
+        .bits = "1d00ffff", .network_difficulty = 1.0,
+        .coinbase_value_sats = 5000000000LL, .tx_count = 1,
+        .tx_fees_sats = 0, .source = "enforcer", .cb_spendable = 1,
+        .cb_op_returns = 2, .longpoll = 1, .rate_sats_per_diff = 0.0,
+    };
+    assert(store_record_template(s, &t) == 0);
+
+    int confirmed = 0, orphaned = 0, pending = 0;
+    assert(store_reconcile_blocks_from_templates(s, 800005, &confirmed,
+                                                 &orphaned, &pending) == 0);
+    assert(confirmed == 1);
+    assert(orphaned == 1);
+    assert(pending == 1);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    char st[32] = {0};
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_win'",
+                st, sizeof st);
+    assert(strcmp(st, "confirmed") == 0);
+    /* tip 800005, block at 800001 → 5 confirmations. */
+    assert(scalar_i64(db,
+        "SELECT confirmations FROM blocks_found WHERE hash='hash_win'") == 5);
+    scalar_text(db, "SELECT checked_via FROM blocks_found WHERE hash='hash_win'",
+                st, sizeof st);
+    assert(strcmp(st, "tips") == 0);
+
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_lose'",
+                st, sizeof st);
+    assert(strcmp(st, "orphaned") == 0);
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_unseen'",
+                st, sizeof st);
+    assert(strcmp(st, "pending") == 0);
+
+    /* Both candidates at 800001 are still on record. Losing a race is not a
+     * reason to forget the work was done. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE height=800001") == 2);
+
+    /* A reorg: a later template at the same height now builds on someone
+     * else. The confirmed block must be demoted, not left paid. */
+    store_template_t t2 = t;
+    t2.ts_s = 3000;
+    t2.prev_hash = "hash_lose";
+    t2.bits = "1d00fffe";   /* different work, so it opens its own row */
+    assert(store_record_template(s, &t2) == 0);
+    assert(store_reconcile_blocks_from_templates(s, 800006, &confirmed,
+                                                 &orphaned, &pending) == 0);
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_win'",
+                st, sizeof st);
+    assert(strcmp(st, "orphaned") == 0);
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_lose'",
+                st, sizeof st);
+    assert(strcmp(st, "confirmed") == 0);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_reconcile_from_templates\n");
+}
+
+/* The unique index has to survive a table that already holds duplicates —
+ * as a plain migration it would fail and be swallowed as a warning, leaving
+ * it absent on exactly the databases that needed it. */
+static void test_block_hash_index_after_dedupe(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* The same solution recorded twice — the stratum dedupe ring is in
+     * memory, so a restart can do this. */
+    assert(store_record_block(s, 1000, 800001, "dup_hash", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
+    assert(store_record_block(s, 1001, 800001, "dup_hash", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
+    /* Distinct competing candidates must NOT be collapsed. */
+    assert(store_record_block(s, 1002, 800001, "other_hash", "w2", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT count(*) FROM blocks_found") == 3);
+
+    /* A verdict reached on the duplicate must not be lost when it is
+     * collapsed away. */
+    assert(store_set_block_status(s, "dup_hash", STORE_BLOCK_CONFIRMED, 3,
+                                  "tips") == 0);
+    assert(sqlite3_exec(db, "UPDATE blocks_found SET status='pending' "
+                            "WHERE id=(SELECT MIN(id) FROM blocks_found "
+                            "           WHERE hash='dup_hash')",
+                        NULL, NULL, NULL) == SQLITE_OK);
+
+    assert(store_finalize_block_hash_index(s) == 0);
+
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='dup_hash'") == 1);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='other_hash'") == 1);
+    char st[32] = {0};
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='dup_hash'",
+                st, sizeof st);
+    assert(strcmp(st, "confirmed") == 0);
+    /* The index actually exists — the whole point. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM sqlite_master WHERE type='index' "
+        "  AND name='blocks_found_hash_idx'") == 1);
+
+    /* And it now holds: a re-found hash cannot create a second row, and the
+     * OR IGNORE means it does not fail the batch either. */
+    assert(store_record_block(s, 1003, 800001, "dup_hash", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL, 0.0) == 0);
+    assert(store_flush(s) == 0);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='dup_hash'") == 1);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_block_hash_index_after_dedupe\n");
+}
+
+/* PPLNS: a matured block is split across the last-N window in proportion to
+ * difficulty, and exactly once.
+ *
+ * The window is 100 difficulty units. Shares are laid down so the boundary
+ * lands in a known place: alice contributes 10 shares of difficulty 5 (50),
+ * bob 10 of difficulty 5 (50) interleaved, and behind them sits a wall of
+ * older work by carol that must NOT be paid — it is outside the window, which
+ * is the entire point of PPLNS and the thing a naive "sum all shares" query
+ * gets wrong. */
+static void test_pplns_distributes_the_window(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Old work, well outside the window. */
+    for (int i = 0; i < 40; ++i) {
+        assert(store_record_share_addr(s, "carol", "addr_c",
+                                       1000ULL + (uint64_t)i, 25.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    /* The window: alice and bob, 50 difficulty each. */
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       2000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+        assert(store_record_share_addr(s, "bob", "addr_b",
+                                       2100ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    /* The block-finding share itself, by alice, difficulty 0 so it does not
+     * shift the split — this test is about the window, not about the finder
+     * getting anything extra. Under PPLNS the finder gets no premium. */
+    assert(store_record_share_addr(s, "alice", "addr_a", 3000, 0.0,
+                                   1, "blk_pplns", 0, 0.0) == 0);
+    /* window = 100 difficulty units, gross = 100000 sats. */
+    assert(store_record_block(s, 3000, 800100, "blk_pplns", "alice", "addr_a",
+                              90000, 10000, STORE_BLOCK_PENDING, NULL,
+                              100.0) == 0);
+    assert(store_flush(s) == 0);
+
+    /* Pending: nothing is owed yet. */
+    int blocks = 0, workers = 0;
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, NULL, 0) == 0);
+    assert(blocks == 0);
+
+    /* Confirmed but immature: still nothing. A coinbase output is unspendable
+     * until 100 deep, so crediting here would create a balance the pool
+     * cannot fund. */
+    assert(store_set_block_status(s, "blk_pplns", STORE_BLOCK_CONFIRMED,
+                                  6, "node") == 0);
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, NULL, 0) == 0);
+    assert(blocks == 0);
+
+    /* Matured. */
+    assert(store_set_block_status(s, "blk_pplns", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, NULL, 0) == 1);
+    assert(blocks == 1);
+    assert(workers == 2);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+
+    int64_t a = scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                               " (SELECT id FROM workers WHERE name='alice')");
+    int64_t b = scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                               " (SELECT id FROM workers WHERE name='bob')");
+    int64_t c = scalar_i64(db, "SELECT COALESCE(SUM(accrued_sats),0) FROM pps_credits"
+                               " WHERE worker_id ="
+                               " (SELECT id FROM workers WHERE name='carol')");
+    /* 50/50 of reward+fees. Fees are included deliberately: PPLNS shares what
+     * the block actually earned, not a subsidy-only estimate. */
+    assert(a == 50000);
+    assert(b == 50000);
+    /* carol mined before the window and is paid nothing, however much work she
+     * did. That is what makes the window a window. */
+    assert(c == 0);
+
+    /* Exactly once. Crediting is additive, so a second pass would double every
+     * balance and leave no trace in the amounts themselves. */
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, NULL, 0) == 0);
+    assert(blocks == 0);
+    assert(scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                          " (SELECT id FROM workers WHERE name='alice')") == 50000);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pplns_distributes_the_window\n");
+}
+
+/* A fee below the dust limit is not deducted from what miners are credited.
+ *
+ * The coinbase drops an operator output worth less than COINBASE_DUST_SATS, so
+ * on a small block the pool wallet receives the whole reward. The distributor
+ * has to share out that whole reward: taking fee_bps off it anyway leaves sats
+ * in the pool wallet that no miner is credited for. 50000 sats at 1% is a
+ * 500-sat fee, under 546, so nothing comes off. */
+static void test_pplns_does_not_deduct_a_dust_fee(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       2000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+        assert(store_record_share_addr(s, "bob", "addr_b",
+                                       2100ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_record_share_addr(s, "alice", "addr_a", 3000, 0.0,
+                                   1, "blk_dustfee", 0, 0.0) == 0);
+    /* Recorded as the coinbase paid it: the whole 50000 to the pool, no fee. */
+    assert(store_record_block(s, 3000, 800200, "blk_dustfee", "alice", "addr_a",
+                              50000, 0, STORE_BLOCK_PENDING, NULL, 100.0) == 0);
+    assert(store_flush(s) == 0);
+    assert(store_set_block_status(s, "blk_dustfee", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+
+    int blocks = 0, workers = 0;
+    assert(store_pplns_distribute(s, 100, 100, &blocks, &workers, NULL, 0) == 1);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT SUM(accrued_sats) FROM pps_credits") == 50000);
+    assert(scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                          " (SELECT id FROM workers WHERE name='alice')") == 25000);
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pplns_does_not_deduct_a_dust_fee\n");
+}
+
+/* A fee at or above the dust limit still comes off the top. 1,000,000 sats at
+ * 1% is 10000 sats of fee, leaving 990000 to share. */
+static void test_pplns_deducts_a_real_fee(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    for (int i = 0; i < 10; ++i)
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       2000ULL + (uint64_t)i, 10.0,
+                                       0, NULL, 0, 0.0) == 0);
+    assert(store_record_share_addr(s, "alice", "addr_a", 3000, 0.0,
+                                   1, "blk_realfee", 0, 0.0) == 0);
+    assert(store_record_block(s, 3000, 800201, "blk_realfee", "alice", "addr_a",
+                              990000, 10000, STORE_BLOCK_PENDING, NULL, 100.0) == 0);
+    assert(store_flush(s) == 0);
+    assert(store_set_block_status(s, "blk_realfee", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+
+    int blocks = 0, workers = 0;
+    assert(store_pplns_distribute(s, 100, 100, &blocks, &workers, NULL, 0) == 1);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT SUM(accrued_sats) FROM pps_credits") == 990000);
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pplns_deducts_a_real_fee\n");
+}
+
+/* Two matured blocks settled by a single pass.
+ *
+ * Every other pplns test distributes exactly one block per call, which never
+ * exercises the loop's second iteration. That iteration is where the shape of
+ * store_pplns_distribute matters: the outer SELECT over blocks_found is still
+ * stepping while the body opens a transaction, UPDATEs the very table that
+ * SELECT is reading, and commits it. If committing mid-iteration were refused,
+ * or if marking a row changed what the open cursor still had to return, the
+ * first block would settle and the second would be skipped or double-paid --
+ * and with crediting additive, double-paying is the failure that cannot be
+ * undone by running again. */
+static void test_pplns_distributes_two_blocks_in_one_pass(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Block one's window: alice, 50 difficulty. */
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       1000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_record_share_addr(s, "alice", "addr_a", 1100, 0.0,
+                                   1, "blk_one", 0, 0.0) == 0);
+    /* Block two's window: bob, 50 difficulty, entirely after block one's. */
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "bob", "addr_b",
+                                       2000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_record_share_addr(s, "bob", "addr_b", 2100, 0.0,
+                                   1, "blk_two", 0, 0.0) == 0);
+
+    assert(store_record_block(s, 1100, 800300, "blk_one", "alice", "addr_a",
+                              100000, 0, STORE_BLOCK_PENDING, NULL, 50.0) == 0);
+    assert(store_record_block(s, 2100, 800301, "blk_two", "bob", "addr_b",
+                              100000, 0, STORE_BLOCK_PENDING, NULL, 50.0) == 0);
+    assert(store_flush(s) == 0);
+
+    assert(store_set_block_status(s, "blk_one", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+    assert(store_set_block_status(s, "blk_two", STORE_BLOCK_CONFIRMED,
+                                  100, "node") == 0);
+
+    /* Both, in one call. */
+    int blocks = 0, workers = 0;
+    char err[256] = {0};
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, err, sizeof err) == 2);
+    assert(blocks == 2);
+    assert(workers == 2);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                          " (SELECT id FROM workers WHERE name='alice')") == 100000);
+    assert(scalar_i64(db, "SELECT accrued_sats FROM pps_credits WHERE worker_id ="
+                          " (SELECT id FROM workers WHERE name='bob')") == 100000);
+    /* Both latched, so a second pass is a no-op rather than a second payment. */
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM blocks_found"
+                          " WHERE pplns_distributed = 1") == 2);
+    assert(store_pplns_distribute(s, 100, 0, &blocks, &workers, NULL, 0) == 0);
+    assert(blocks == 0);
+    assert(scalar_i64(db, "SELECT SUM(accrued_sats) FROM pps_credits") == 200000);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pplns_distributes_two_blocks_in_one_pass\n");
+}
+
+/* ---- the window as it stands now ---------------------------------------
+ *
+ * store_pplns_distribute() reads the window of a block that already matured.
+ * A coinbase-direct pool needs the window a block found RIGHT NOW would pay,
+ * ~100 blocks before the other one runs. Same walk, different anchor.
+ *
+ * The property that matters is that the two agree. If the template promises a
+ * split the distributor would not have produced, the pool pays out something
+ * other than what it advertised. */
+static void test_the_window_now_matches_the_distributor(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Old work, well outside a 100-difficulty window. */
+    for (int i = 0; i < 40; ++i) {
+        assert(store_record_share_addr(s, "carol", "addr_c",
+                                       1000ULL + (uint64_t)i, 25.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    /* The window: alice and bob, 50 difficulty each. */
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       2000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+        assert(store_record_share_addr(s, "bob", "addr_b",
+                                       2100ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_flush(s) == 0);
+
+    store_window_entry_t win[8];
+    size_t n = 0; double total = 0.0; int truncated = 1;
+    char err[256] = {0};
+    int rc = store_pplns_window(s, 100.0, win, 8, &n, &total, &truncated,
+                                err, sizeof err);
+    assert(rc == 2);
+    assert(n == 2);
+    assert(truncated == 0);
+    /* Ordered largest first; equal here, so the tie breaks by worker id and
+     * alice (inserted first) leads. */
+    assert(win[0].difficulty > 49.9 && win[0].difficulty < 50.1);
+    assert(win[1].difficulty > 49.9 && win[1].difficulty < 50.1);
+    assert(total > 99.9 && total < 100.1);
+    /* carol did 1000 difficulty and is outside the window: absent entirely,
+     * and absent from the denominator, so she does not dilute anyone. */
+    for (size_t i = 0; i < n; ++i)
+        assert(strcmp(win[i].payout_address, "addr_c") != 0);
+
+    store_close(s);
+    printf("  ok test_the_window_now_matches_the_distributor\n");
+}
+
+/* A worker with no payout address cannot be given a coinbase output. Leaving
+ * it in the denominator would shrink everyone else's share to fund an output
+ * that is never created -- value destroyed rather than merely unpaid. */
+static void test_a_worker_with_no_address_is_left_out_of_the_split(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "alice", "addr_a",
+                                       2000ULL + (uint64_t)i, 5.0,
+                                       0, NULL, 0, 0.0) == 0);
+        /* No payout address at all -- the legacy/solo share path. */
+        assert(store_record_share(s, "nobody", 2100ULL + (uint64_t)i, 5.0,
+                                  0, NULL) == 0);
+    }
+    assert(store_flush(s) == 0);
+
+    store_window_entry_t win[8];
+    size_t n = 0; double total = 0.0; int truncated = 0;
+    char err[256] = {0};
+    assert(store_pplns_window(s, 100.0, win, 8, &n, &total, &truncated,
+                              err, sizeof err) == 1);
+    assert(n == 1);
+    assert(strcmp(win[0].payout_address, "addr_a") == 0);
+    /* 50, not 100: the unpayable worker is out of the denominator too, so
+     * alice's proportion is of what can actually be paid. */
+    assert(total > 49.9 && total < 50.1);
+    store_close(s);
+    printf("  ok test_a_worker_with_no_address_is_left_out_of_the_split\n");
+}
+
+/* Truncation redistributes rather than carries, so it must be reported: the
+ * caller has to decide, not discover it in the amounts. */
+static void test_a_window_wider_than_the_cap_says_so(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    for (int w = 0; w < 6; ++w) {
+        char name[32], addr[32];
+        snprintf(name, sizeof name, "w%d", w);
+        snprintf(addr, sizeof addr, "addr_%d", w);
+        assert(store_record_share_addr(s, name, addr, 3000ULL + (uint64_t)w,
+                                       10.0, 0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_flush(s) == 0);
+
+    store_window_entry_t win[3];
+    size_t n = 0; double total = 0.0; int truncated = 0;
+    char err[256] = {0};
+    assert(store_pplns_window(s, 1000.0, win, 3, &n, &total, &truncated,
+                              err, sizeof err) == 3);
+    assert(n == 3);
+    assert(truncated == 1);
+    store_close(s);
+    printf("  ok test_a_window_wider_than_the_cap_says_so\n");
+}
+
+/* A pool that has just started has no shares. Nobody to pay is not an error
+ * here -- it is the caller's cue not to build a coinbase-direct template. */
+static void test_an_empty_window_returns_nothing_not_an_error(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    store_window_entry_t win[4];
+    size_t n = 1; double total = 1.0; int truncated = 1;
+    char err[256] = {0};
+    assert(store_pplns_window(s, 100.0, win, 4, &n, &total, &truncated,
+                              err, sizeof err) == 0);
+    assert(n == 0);
+    assert(total == 0.0);
+    assert(truncated == 0);
+    /* A non-positive window is a config bug, not an empty pool. */
+    assert(store_pplns_window(s, 0.0, win, 4, &n, &total, &truncated,
+                              err, sizeof err) < 0);
+    store_close(s);
+    printf("  ok test_an_empty_window_returns_nothing_not_an_error\n");
+}
+
+/* The payout floor has to reach the DASHBOARD, not just the operator's log.
+ *
+ * pplns-coinbase pays a claim below the floor nothing from that block -- its
+ * share goes to the other miners in the window and the miner is owed a turn
+ * in the payout queue, so being small costs frequency rather than money --
+ * and the entire case for that policy is that it is disclosed up front. The
+ * miner it costs reads the dashboard; the operator's terminal is the one
+ * place they cannot see. So the floor being in pool_meta is part of the
+ * policy, not a nicety.
+ *
+ * NULL in every other mode, distinctly from 0: "this pool has no floor" and
+ * "this pool's floor is zero sats" are different claims, and only the first
+ * is true of solo, pps-classic and the two custodial pplns rails. */
+static void test_the_payout_floor_is_published_for_the_dashboard(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    assert(store_record_pool_identity(s, "regtest", "node", "/sp/",
+                                      "bcrt1qop", NULL, NULL, 25000) == 0);
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT pplns_payout_floor_sats FROM pool_meta") == 25000);
+
+    /* A mode with no floor stores NULL, not 0. */
+    assert(store_record_pool_identity(s, "regtest", "node", "/sp/",
+                                      "bcrt1qop", NULL, NULL, -1) == 0);
+    assert(scalar_i64(db, "SELECT pplns_payout_floor_sats IS NULL "
+                          "FROM pool_meta") == 1);
+
+    /* Zero is a real floor and must survive as 0, not collapse to NULL --
+     * it means "pay anything the dust limit allows", which is a different
+     * promise from "there is no floor here". */
+    assert(store_record_pool_identity(s, "regtest", "node", "/sp/",
+                                      "bcrt1qop", NULL, NULL, 0) == 0);
+    assert(scalar_i64(db, "SELECT pplns_payout_floor_sats IS NULL "
+                          "FROM pool_meta") == 0);
+    assert(scalar_i64(db, "SELECT pplns_payout_floor_sats FROM pool_meta") == 0);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_the_payout_floor_is_published_for_the_dashboard\n");
+}
+
+/* The window query must read only as far back as the window reaches.
+ *
+ * The version this replaced summed a running total over the WHOLE shares table
+ * and applied the boundary afterwards, so every template build re-read every
+ * share the pool had ever recorded: 250ms per million rows, on the template
+ * thread. A production pool reported a 5.5 GB database, where that is half a
+ * minute per template and the pool simply stops publishing work.
+ *
+ * The replacement walks back in bounded batches, growing x4 until the batch
+ * covers the window. These tests exist for that widening, because it is the
+ * part that can silently return a PARTIAL window -- which would not error, it
+ * would just pay the wrong people.
+ *
+ * The error paths through the same loop are covered separately, in
+ * tests/test_store_walk.c, which injects sqlite failures. */
+static void test_the_window_reads_past_the_first_batch(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* 10,000 shares of difficulty 1 across 4 workers. The first batch is
+     * 4096, so a 6000-wide window MUST make the walk widen; if it did not,
+     * the total would come back as 4096 and nobody would notice but the
+     * miners. */
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+    for (int i = 1; i <= 4; ++i) {
+        char q[256];
+        snprintf(q, sizeof q,
+                 "INSERT INTO workers (id,name,payout_address,first_seen,last_seen)"
+                 " VALUES (%d,'w%d','bc1qw%d',1,1)", i, i, i);
+        assert(sqlite3_exec(db, q, NULL, NULL, NULL) == SQLITE_OK);
+    }
+    for (int i = 0; i < 10000; ++i) {
+        char q[160];
+        snprintf(q, sizeof q,
+                 "INSERT INTO shares (worker_id,ts,difficulty) VALUES (%d,1,1.0)",
+                 (i % 4) + 1);
+        assert(sqlite3_exec(db, q, NULL, NULL, NULL) == SQLITE_OK);
+    }
+    sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+    sqlite3_close(db);
+
+    store_window_entry_t win[16];
+    size_t n = 0; double total = 0; int truncated = 0; char err[256];
+
+    /* Inside the first batch. */
+    assert(store_pplns_window(s, 1000.0, win, 16, &n, &total, &truncated,
+                              err, sizeof err) > 0);
+    assert(total == 1000.0);
+
+    /* Past it — this is the case the widening exists for. */
+    assert(store_pplns_window(s, 6000.0, win, 16, &n, &total, &truncated,
+                              err, sizeof err) > 0);
+    assert(total == 6000.0);
+
+    /* Wider than the entire history: every share, and no infinite loop
+     * growing past the end of the table. */
+    assert(store_pplns_window(s, 999999.0, win, 16, &n, &total, &truncated,
+                              err, sizeof err) > 0);
+    assert(total == 10000.0);
+
+    store_close(s);
+    printf("  ok test_the_window_reads_past_the_first_batch\n");
+}
+
+/* ---- the pplns-coinbase payout queue ------------------------------------
+ *
+ * A signed fraction of one block reward per worker: positive means skipped and
+ * owed a slot, negative means paid early out of somebody else's skipped share.
+ * It is a memory of whose turn it is, NOT a balance — the pool holds no money
+ * against it, and deleting the table would cost nobody a payment.
+ *
+ * The invariant that makes that claim checkable is that it sums to zero. These
+ * tests exist for it, and for the orphan case, which is the one that can
+ * silently move a miner down the queue for a payment it never received. */
+static void test_fraction_deltas_must_sum_to_zero(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    /* Balanced: one miner skipped, one paid early by the same amount. */
+    store_fraction_delta_t ok_[] = { {1, 0.25}, {2, -0.25} };
+    assert(store_stage_block_fractions(s, "aa", ok_, 2, err, sizeof err) == 2);
+
+    /* Unbalanced: this would invent a turn out of nothing. */
+    store_fraction_delta_t bad[] = { {1, 0.25}, {2, -0.10} };
+    assert(store_stage_block_fractions(s, "bb", bad, 2, err, sizeof err) < 0);
+    assert(strstr(err, "sum to") != NULL);
+
+    /* A delta with no worker behind it cannot be staged — there is no row to
+     * hold it. It must not be silently dropped from a set that balances only
+     * WITH it: what reaches the table would then not cancel, which is the
+     * exact state the check above exists to make impossible, arrived at by
+     * passing the check rather than failing it.
+     *
+     * pplns_claim_t documents worker_id 0 as "unknown", so this is a shape the
+     * callers can produce rather than a hypothetical. */
+    err[0] = '\0';
+    store_fraction_delta_t orphan[] = { {0, 0.25}, {2, -0.25} };
+    assert(store_stage_block_fractions(s, "cc", orphan, 2, err, sizeof err) < 0);
+    assert(strstr(err, "sum to") != NULL);
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM pplns_pending_fractions "
+                          "WHERE block_hash='cc'") == 0);
+
+    /* A set that is entirely worker-less writes nothing and is not an error:
+     * there is no rotation to record, and nothing about the ledger changed. */
+    store_fraction_delta_t none[] = { {0, 0.0} };
+    assert(store_stage_block_fractions(s, "dd", none, 1, err, sizeof err) == 0);
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM pplns_pending_fractions "
+                          "WHERE block_hash='dd'") == 0);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_fraction_deltas_must_sum_to_zero\n");
+}
+
+/* With nothing staged, settling must not open a write transaction.
+ *
+ * This runs on every reconcile pass in every mode, including the four that can
+ * never stage a row, and BEGIN IMMEDIATE takes the database's write lock and
+ * txn_mu with it — stalling the commit thread's share batch to settle a table
+ * that is empty and always will be.
+ *
+ * Asserted by holding the write lock from ANOTHER connection. A settle that
+ * needs a transaction of its own cannot get one and fails after busy_timeout;
+ * one that checks first sails past, because it only ever read. */
+static void test_settling_nothing_takes_no_write_lock(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    sqlite3 *writer = NULL;
+    assert(sqlite3_open(path, &writer) == SQLITE_OK);
+    assert(sqlite3_exec(writer, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK);
+
+    int applied = -1, discarded = -1;
+    assert(store_settle_block_fractions(s, &applied, &discarded,
+                                        err, sizeof err) == 0);
+    assert(applied == 0 && discarded == 0);
+
+    assert(sqlite3_exec(writer, "ROLLBACK", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(writer);
+    store_close(s);
+    printf("  ok test_settling_nothing_takes_no_write_lock\n");
+}
+
+/* Staged rows do nothing until the block they came from is CONFIRMED — and
+ * are thrown away if it is orphaned. A block that never stood paid nobody and
+ * rotated nobody. */
+static void test_only_a_confirmed_block_moves_the_queue(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "INSERT INTO workers (id,name,payout_address,first_seen,last_seen)"
+        " VALUES (1,'a','bc1qa',1,1),(2,'b','bc1qb',1,1)",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)"
+        " VALUES (1,10,'good',100,1,'pending'),(1,11,'bad',100,1,'pending')",
+        NULL, NULL, NULL) == SQLITE_OK);
+
+    store_fraction_delta_t d1[] = { {1, 0.25}, {2, -0.25} };
+    store_fraction_delta_t d2[] = { {1, 0.50}, {2, -0.50} };
+    assert(store_stage_block_fractions(s, "good", d1, 2, err, sizeof err) == 2);
+    assert(store_stage_block_fractions(s, "bad",  d2, 2, err, sizeof err) == 2);
+
+    /* Both blocks are still pending: nothing has moved. */
+    int applied = -1, discarded = -1;
+    assert(store_settle_block_fractions(s, &applied, &discarded, err, sizeof err) == 0);
+    assert(applied == 0 && discarded == 0);
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM pplns_fractions") == 0);
+
+    /* One confirms, one is orphaned. */
+    assert(sqlite3_exec(db, "UPDATE blocks_found SET status='confirmed' WHERE hash='good'",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(db, "UPDATE blocks_found SET status='orphaned' WHERE hash='bad'",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    assert(store_settle_block_fractions(s, &applied, &discarded, err, sizeof err) == 0);
+    assert(applied == 1);
+    assert(discarded == 1);
+
+    /* Only the confirmed block's rotation took effect... */
+    char buf[64];
+    scalar_text(db, "SELECT CAST(ROUND(owed_fraction*100) AS INT) "
+                    "FROM pplns_fractions WHERE worker_id=1", buf, sizeof buf);
+    assert(strcmp(buf, "25") == 0);       /* 0.25, not 0.75 */
+    /* ...and the ledger still sums to zero. */
+    scalar_text(db, "SELECT CAST(ROUND(SUM(owed_fraction)*1000) AS INT) "
+                    "FROM pplns_fractions", buf, sizeof buf);
+    assert(strcmp(buf, "0") == 0);
+    /* Nothing is left staged, so a second pass is a no-op. */
+    assert(scalar_i64(db, "SELECT COUNT(*) FROM pplns_pending_fractions") == 0);
+    assert(store_settle_block_fractions(s, &applied, &discarded, err, sizeof err) == 0);
+    assert(applied == 0 && discarded == 0);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_only_a_confirmed_block_moves_the_queue\n");
+}
+
+/* Two confirmed blocks that both moved the same worker must move it twice.
+ * Settling them in one statement would fold the rows together and lose one. */
+static void test_two_confirmed_blocks_both_count(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_exec(db, "INSERT INTO workers (id,name,payout_address,first_seen,last_seen)"
+                     " VALUES (1,'a','bc1qa',1,1),(2,'b','bc1qb',1,1)", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)"
+                     " VALUES (1,10,'h1',100,1,'confirmed'),(1,11,'h2',100,1,'confirmed')",
+                 NULL, NULL, NULL);
+    store_fraction_delta_t d[] = { {1, 0.25}, {2, -0.25} };
+    assert(store_stage_block_fractions(s, "h1", d, 2, err, sizeof err) == 2);
+    assert(store_stage_block_fractions(s, "h2", d, 2, err, sizeof err) == 2);
+
+    int applied = 0, discarded = 0;
+    assert(store_settle_block_fractions(s, &applied, &discarded, err, sizeof err) == 0);
+    assert(applied == 2);
+    char buf[64];
+    scalar_text(db, "SELECT CAST(ROUND(owed_fraction*100) AS INT) "
+                    "FROM pplns_fractions WHERE worker_id=1", buf, sizeof buf);
+    assert(strcmp(buf, "50") == 0);       /* 0.25 twice, not folded to 0.25 */
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_two_confirmed_blocks_both_count\n");
+}
+
+/* The window hands the ledger standing back with each claim, so the ordering
+ * policy can see it. Zero for a worker that has never been skipped. */
+static void test_the_window_reports_each_workers_standing(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    sqlite3_exec(db, "INSERT INTO workers (id,name,payout_address,first_seen,last_seen)"
+                     " VALUES (1,'a','bc1qa',1,1),(2,'b','bc1qb',1,1)", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO shares (worker_id,ts,difficulty) VALUES"
+                     " (1,1,10.0),(2,1,5.0)", NULL, NULL, NULL);
+    sqlite3_exec(db, "INSERT INTO pplns_fractions (worker_id,owed_fraction,updated_at)"
+                     " VALUES (2,0.4,1)", NULL, NULL, NULL);
+    sqlite3_close(db);
+
+    store_window_entry_t win[4];
+    size_t n = 0; double total = 0; int tr = 0; char err[256];
+    assert(store_pplns_window(s, 100.0, win, 4, &n, &total, &tr, err, sizeof err) == 2);
+    /* Largest claim first, as always. */
+    assert(win[0].worker_id == 1 && win[0].owed_fraction == 0.0);
+    assert(win[1].worker_id == 2);
+    assert(win[1].owed_fraction > 0.39 && win[1].owed_fraction < 0.41);
+    store_close(s);
+    printf("  ok test_the_window_reports_each_workers_standing\n");
+}
+
+/* Writes from three threads on one connection must not overlap, and none may
+ * be lost.
+ *
+ * The store shares a single sqlite connection between the commit thread, the
+ * tip watcher and the stratum submit path, and none of the other locks covers
+ * that: `mu` guards the ring buffer and writer_main() releases it BEFORE
+ * calling commit_batch(), which takes no lock at all. Two transactions could
+ * therefore overlap, and BEGIN IMMEDIATE simply failed for the loser. Being a
+ * race, it surfaced as an occasional dropped write with a WARN rather than
+ * anything reproducible — a block's payout-queue rotation, in the case that
+ * caught it.
+ *
+ * Savepoints were the first fix and were worse: RELEASE does not commit a
+ * nested write (a failed batch discards it after its caller returned success)
+ * and ROLLBACK TO rewinds past the caller's own boundary, taking the commit
+ * thread's shares with it. So a lost queue row became lost SHARES, silently.
+ * Caught in review by Wired4ncer, on #76.
+ *
+ * This drives the actual race: shares stream in — so the commit thread is
+ * opening and closing real batches throughout — while the queue is written
+ * from this thread. Every call must succeed, and every row must be there at
+ * the end. */
+static void test_concurrent_writers_do_not_lose_each_other(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    /* Small window and batch, so the commit thread is busy rather than idle. */
+    cfg.commit_window_ms = 1;
+    cfg.commit_max_shares = 4;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    enum { ROUNDS = 120 };
+    int staged_ok = 0;
+    for (int i = 0; i < ROUNDS; ++i) {
+        /* Keep the writer thread in and out of transactions underneath us. */
+        for (int k = 0; k < 8; ++k) {
+            char nm[32];
+            snprintf(nm, sizeof nm, "w%d", k % 4);
+            assert(store_record_share_addr(s, nm, "addr_x",
+                                           1000ULL + (uint64_t)(i * 8 + k),
+                                           1.0, 0, NULL, 0, 0.0) == 0);
+        }
+        char hash[32];
+        snprintf(hash, sizeof hash, "blk_%d", i);
+        store_fraction_delta_t d[] = { {1, 0.25}, {2, -0.25} };
+        int rc = store_stage_block_fractions(s, hash, d, 2, err, sizeof err);
+        if (rc < 0) {
+            printf("FAIL: staging lost to the commit thread on round %d: %s\n",
+                   i, err);
+            assert(0 && "a write must not be refused because a batch was open");
+        }
+        staged_ok++;
+    }
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    /* Every staged round is present: nothing was silently discarded by a
+     * batch that rolled back underneath it. */
+    int64_t staged_rows = scalar_i64(db, "SELECT COUNT(*) FROM pplns_pending_fractions");
+    if (staged_rows != (int64_t)ROUNDS * 2) {
+        printf("FAIL: %d rounds staged 2 rows each, %lld survive\n",
+               staged_ok, (long long)staged_rows);
+        assert(0 && "staged rows were lost");
+    }
+    /* And the shares the commit thread was writing all the while are intact —
+     * this is the half a ROLLBACK TO would have eaten. */
+    int64_t share_rows = scalar_i64(db, "SELECT COUNT(*) FROM shares");
+    if (share_rows != (int64_t)ROUNDS * 8) {
+        printf("FAIL: %d shares recorded, %lld survive\n",
+               ROUNDS * 8, (long long)share_rows);
+        assert(0 && "shares were lost");
+    }
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_concurrent_writers_do_not_lose_each_other "
+           "(%d rounds, %lld shares, %lld staged rows)\n",
+           staged_ok, (long long)share_rows, (long long)staged_rows);
+}
+
+/* A write must not be discarded by somebody else's rollback.
+ *
+ * This is the failure the savepoint version had, and the reason the fix is a
+ * mutex rather than nesting. A savepoint joins whatever transaction is already
+ * open — on this connection, usually the commit thread's share batch — and
+ * RELEASE does not commit it. So when commit_batch() hits a failed COMMIT and
+ * runs ROLLBACK to replay the batch, the nested write goes with it, after its
+ * caller was already told it succeeded. The shares are replayed; nothing
+ * replays the nested row.
+ *
+ * Played out here with the commit thread's half on a second thread: it opens a
+ * transaction, and rolls it back exactly as commit_batch() does on a failed
+ * COMMIT. The staged rows must survive, which they only do if staging waited
+ * for that transaction instead of joining it. */
+typedef struct { store_t *s; int started; int done; } rollback_ctx_t;
+
+static void *rollback_thread(void *arg) {
+    rollback_ctx_t *c = (rollback_ctx_t *)arg;
+    assert(store_begin_txn_for_test(c->s) == 0);
+    __atomic_store_n(&c->started, 1, __ATOMIC_SEQ_CST);
+    /* Hold it long enough that a staging call made now would have to make a
+     * choice: wait, or nest into this. */
+    struct timespec ts = { 0, 150 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    assert(store_rollback_txn_for_test(c->s) == 0);
+    __atomic_store_n(&c->done, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+
+static void test_a_write_survives_another_threads_rollback(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    char err[256] = {0};
+
+    rollback_ctx_t ctx = { s, 0, 0 };
+    pthread_t th;
+    assert(pthread_create(&th, NULL, rollback_thread, &ctx) == 0);
+    while (!__atomic_load_n(&ctx.started, __ATOMIC_SEQ_CST)) { }
+
+    /* The transaction that is about to be rolled back is open right now. */
+    store_fraction_delta_t d[] = { {1, 0.25}, {2, -0.25} };
+    int rc = store_stage_block_fractions(s, "blk_rb", d, 2, err, sizeof err);
+    assert(rc == 2);
+    /* If staging joined that transaction rather than waiting for it, this
+     * returned success and the rollback below eats the rows. */
+    assert(__atomic_load_n(&ctx.done, __ATOMIC_SEQ_CST) == 1 &&
+           "staging returned before the other transaction ended, so it nested");
+
+    pthread_join(th, NULL);
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    int64_t rows = scalar_i64(db, "SELECT COUNT(*) FROM pplns_pending_fractions");
+    if (rows != 2) {
+        printf("FAIL: staging reported success and %lld of 2 rows survive — "
+               "the write was discarded by another thread's rollback\n",
+               (long long)rows);
+        assert(0);
+    }
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_a_write_survives_another_threads_rollback\n");
+}
+
+/* The operator fee comes off the top, exactly as in solo and PPS. */
+static void test_pplns_takes_the_operator_fee(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+    for (int i = 0; i < 10; ++i) {
+        assert(store_record_share_addr(s, "solo_miner", "addr_a",
+                                       2000ULL + (uint64_t)i, 10.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_record_share_addr(s, "solo_miner", "addr_a", 3000, 0.0,
+                                   1, "blk_fee", 0, 0.0) == 0);
+    assert(store_record_block(s, 3000, 800200, "blk_fee", "solo_miner", "addr_a",
+                              100000, 0, STORE_BLOCK_PENDING, NULL, 100.0) == 0);
+    assert(store_flush(s) == 0);
+    assert(store_set_block_status(s, "blk_fee", STORE_BLOCK_CONFIRMED, 100, "node") == 0);
+
+    int blocks = 0, workers = 0;
+    /* 100 bps = 1%. */
+    assert(store_pplns_distribute(s, 100, 100, &blocks, &workers, NULL, 0) == 1);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT accrued_sats FROM pps_credits") == 99000);
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pplns_takes_the_operator_fee\n");
+}
+
 int main(void) {
     log_init(2 /* WARN */);
     printf("running test_store...\n");
@@ -616,10 +2050,34 @@ int main(void) {
     test_concurrent();
     test_drop();
     test_credited_sats();
+    test_pool_identity();
     test_rate_history();
     test_template_history();
     test_template_retention();
     test_commit_survives_a_locked_db();
+    test_block_candidate_status();
+    test_reconcile_from_templates();
+    test_block_hash_index_after_dedupe();
+    test_open_upgrades_a_pre_status_database();
+    test_pplns_distributes_the_window();
+    test_pplns_does_not_deduct_a_dust_fee();
+    test_pplns_deducts_a_real_fee();
+    test_pplns_takes_the_operator_fee();
+    test_the_payout_floor_is_published_for_the_dashboard();
+    test_the_window_reads_past_the_first_batch();
+    test_fraction_deltas_must_sum_to_zero();
+    test_settling_nothing_takes_no_write_lock();
+    test_only_a_confirmed_block_moves_the_queue();
+    test_two_confirmed_blocks_both_count();
+    test_concurrent_writers_do_not_lose_each_other();
+    test_a_write_survives_another_threads_rollback();
+    test_the_window_reports_each_workers_standing();
+    test_pplns_distributes_two_blocks_in_one_pass();
+    test_an_empty_window_returns_nothing_not_an_error();
+    test_a_window_wider_than_the_cap_says_so();
+    test_a_worker_with_no_address_is_left_out_of_the_split();
+    test_the_window_now_matches_the_distributor();
+    test_schema_sql_matches_store_schema();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;

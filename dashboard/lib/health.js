@@ -28,6 +28,27 @@ import { rateVerification } from './stats.js';
  * drynet3. An hour means something is genuinely wrong, not slow. */
 const PAYOUT_STALL_SEC = 3600;
 
+/* The block subsidy at a height, on the standard schedule: 50 BTC, halved
+ * every 210,000 blocks. Chains derived from Bitcoin — mainnet, testnet,
+ * signet, and forknets that keep their parent's height — all share it;
+ * regtest's 150-block interval is the exception, and a regtest pool will
+ * report this check as failing, which is the correct thing for it to say
+ * rather than silently accepting any number.
+ *
+ * Returns 0 past the last era, where there is nothing left to check. */
+/* Target seconds between blocks. 600 on Bitcoin and everything derived from
+ * it; the proxy has this as block_interval_sec but the dashboard reads the DB
+ * only, and a chain that changed it would need this changed too. */
+const BLOCK_INTERVAL_SEC = 600;
+
+const HALVING_INTERVAL = 210000;
+export function subsidyAt(height) {
+    if (!Number.isFinite(height) || height < 0) return 0;
+    const era = Math.floor(height / HALVING_INTERVAL);
+    if (era >= 64) return 0;
+    return Math.floor(50e8 / Math.pow(2, era));
+}
+
 function one(d, sql, ...args) {
     return d.prepare(sql).get(...args);
 }
@@ -96,17 +117,271 @@ export function health(handle) {
     }));
 
     /* Mined minus owed. Negative means the pool cannot cover its PPS
-     * liability out of what it has actually earned. */
+     * liability out of what it has actually earned.
+     *
+     * CONFIRMED ONLY. A row in blocks_found is a block candidate: submitblock
+     * may have refused it, or the chain may have reorged it out, and either
+     * way it pays nothing. Summing every row credited the pool with revenue
+     * that never existed and made this check — the one thing standing between
+     * an operator and paying out more than was ever mined — permanently and
+     * silently green.
+     *
+     * A young pps-classic pool will read red here: it credits shares before
+     * its first confirmed block, so the margin is legitimately negative until
+     * one lands. That is the honest number, not a fault in the check. */
     checks.push(guard('margin', 'Pool solvency', () => {
+        /* Not a question that exists in pplns-coinbase. There the coinbase
+         * pays the miners directly, so blocks_found.reward_sats is what the
+         * block paid THEM -- the pool never received it and owes nobody.
+         * Summing it as pool revenue reported a healthy 50 BTC of solvency
+         * for a pool holding precisely nothing, which is a green light
+         * asserting custody that does not exist. */
+        const mode = one(d, 'SELECT pool_mode FROM pool_meta WHERE id = 1')?.pool_mode;
+        if (mode === 'pplns-coinbase') {
+            return { ok: true, value: null,
+                     detail: 'pplns-coinbase — the pool never holds the reward' };
+        }
         const r = one(d, `
             SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
-                      FROM blocks_found)
+                      FROM blocks_found WHERE status = 'confirmed')
                  - (SELECT COALESCE(SUM(credited_sats),0) FROM shares) AS margin`);
         const m = Number(r?.margin || 0);
         return { ok: m >= 0, value: m,
                  detail: m < 0
                     ? `owed ${(-m / 1e8).toFixed(4)} BTC more than mined`
                     : null };
+    }));
+
+    /* Is PPS fair value still fair on this chain?
+     *
+     * The rate is block_value / network_difficulty — a share's expected value,
+     * and correct only while the pool's solutions can actually become blocks.
+     * A chain accepts one block per interval however fast work arrives, so
+     * once the pool's own difficulty throughput exceeds a block's worth per
+     * interval, the formula is promising blocks that will never be minted, and
+     * it overstates by exactly that ratio.
+     *
+     * The boundary is the difficulty at which this pool alone would find one
+     * block per interval: difficulty_per_second * block_interval.
+     *
+     * Computed here from the shares table rather than read from the proxy, so
+     * it is an independent check on the number the proxy decided to use. The
+     * production pps pool ran at 9,349 difficulty/s on a chain at difficulty
+     * 1, needed 5,609,561, and accrued 15,561,471 BTC against 943.60 BTC
+     * mined. Nothing in the dashboard said a word. */
+    checks.push(guard('pps_difficulty', 'Difficulty supports PPS', () => {
+        const meta = one(d, 'SELECT pool_mode, network_difficulty FROM pool_meta WHERE id = 1');
+        if (!meta || meta.pool_mode !== 'pps-classic') {
+            /* Name the mode we are actually in. This used to say "solo — no
+             * accrual" for every non-pps-classic mode, so a pplns pool of any
+             * kind was told it was solo by the same page whose header said
+             * otherwise. The check skipping is right -- only pps-classic
+             * prices a share on arrival -- but the reason has to be true. */
+            const m = meta?.pool_mode || 'unknown';
+            return { ok: true, value: null,
+                     detail: `${m} — shares are not priced on arrival` };
+        }
+        const r = one(d, `
+            SELECT COALESCE(SUM(difficulty),0) AS sd,
+                   MIN(ts) AS a, MAX(ts) AS b
+              FROM shares WHERE ts >= (SELECT MAX(ts) - 3600 FROM shares)`);
+        const span = Number(r?.b || 0) - Number(r?.a || 0);
+        if (!r || span <= 0) return { ok: true, value: null, detail: 'not enough shares yet' };
+        const dps = Number(r.sd) / span;
+        const needed = dps * BLOCK_INTERVAL_SEC;
+        const actual = Number(meta.network_difficulty || 0);
+        if (needed <= 0 || actual <= 0) return { ok: true, value: null, detail: null };
+        const ratio = actual / needed;
+        return {
+            ok: ratio >= 1,
+            value: Math.round(ratio * 1000) / 1000,
+            detail: ratio >= 1 ? null
+                : `network difficulty ${actual.toFixed(0)} is ${(1/ratio).toFixed(1)}x ` +
+                  `below the ${needed.toFixed(0)} this pool's ${dps.toFixed(0)} ` +
+                  `difficulty/s needs — every share is priced as if the chain ` +
+                  `could absorb it`,
+        };
+    }));
+
+    /* Is every stratum port actually able to serve the difficulty it was
+     * configured for?
+     *
+     * The pool never assigns a share difficulty above the network difficulty:
+     * a miner filters locally against the stratum target, so a share target
+     * harder than the network target throws away valid blocks before the pool
+     * ever sees them. The clamp is right, and it is silent.
+     *
+     * That silence is the problem for a high-difficulty port. An operator
+     * configures 500000 to satisfy a marketplace floor, the chain is at 1200,
+     * and the port serves 1200 while every dashboard reads normal. The
+     * marketplace then measures the difficulty it was actually given, decides
+     * the pool cannot hold its floor, and cancels the order -- and nothing in
+     * the pool ever said why. Binary, actionable, and invisible to every other
+     * query, which is what this banner is for.
+     *
+     * Only ports asking for more than the default are checked. A home-miner
+     * port sitting under the network difficulty is the normal case, not a
+     * finding. */
+    checks.push(guard('listener_difficulty', 'Stratum ports can hold their difficulty', () => {
+        const meta = one(d, 'SELECT network_difficulty, listeners FROM pool_meta WHERE id = 1');
+        const actual = Number(meta?.network_difficulty || 0);
+        if (!meta || !meta.listeners || actual <= 0) {
+            return { ok: true, value: null, detail: 'no ports published yet' };
+        }
+        let ls;
+        try { ls = JSON.parse(meta.listeners); } catch { ls = null; }
+        if (!Array.isArray(ls) || ls.length === 0) {
+            return { ok: true, value: null, detail: 'no ports published yet' };
+        }
+        /* What the port is actually asking the chain for is the higher of the
+         * two: the starting difficulty and the vardiff floor are both clamped
+         * to the network, so a port that starts at 1 but is floored at 500000
+         * cannot hold its floor either — and that configuration is the more
+         * confusing one to debug, because the miner connects at a difficulty
+         * that looks fine. */
+        const asks = l => Math.max(Number(l?.initial_diff || 0),
+                                   Number(l?.min_diff || 0));
+        const promised = l => Number(l?.promised_min_diff || 0);
+        /* A difficulty is not necessarily >= 1 — on a forknet these are
+         * values like 3e-10, and toFixed(0) renders every one as "0". Print
+         * whole numbers plainly and small ones in the exponent form they are
+         * actually configured with. */
+        const fmt = x => (x >= 1 ? x.toFixed(0) : String(Number(x.toPrecision(3))));
+
+        /* Two findings, not one, and they point opposite ways.
+         *
+         * A port that PROMISED a floor (min_diff on its listener line) keeps
+         * it: the pool serves that difficulty even though the chain is
+         * easier, because a marketplace measures the wire and cancels an
+         * order that comes in under what the port advertised. The port works;
+         * what it costs is blocks, since the miner filters locally at the
+         * assigned difficulty and throws away solutions the chain would have
+         * taken. That is a deliberate trade and the operator should see its
+         * size, so report it first — it is the one losing money.
+         *
+         * A port merely CONFIGURED high (initial_diff or vardiff_min, no
+         * promise) is clamped down to the chain and quietly serves less than
+         * it says. Nothing is lost, but rented hashrate pointed at it will
+         * read the pool as below its floor. */
+        const kept = ls.filter(l => promised(l) > actual);
+        if (kept.length > 0) {
+            const worst = kept.reduce((a, b) => (promised(a) > promised(b) ? a : b));
+            const ratio = promised(worst) / actual;
+            return {
+                ok: false,
+                value: kept.length,
+                detail: `port ${worst.port}${worst.label ? ` (${worst.label})` : ''} ` +
+                        `promises min_diff ${fmt(promised(worst))} and the ` +
+                        `pool is holding it, but network difficulty is only ` +
+                        `${fmt(actual)}. Miners there filter locally at the ` +
+                        `promised difficulty, so they discard roughly ` +
+                        `${(ratio - 1).toFixed(0)} of every ${ratio.toFixed(0)} ` +
+                        `blocks they solve. Drop min_diff on this port if keeping ` +
+                        `every block matters more than serving rented hashrate on it`,
+            };
+        }
+
+        const over = ls.filter(l => asks(l) > actual);
+        if (over.length === 0) {
+            return { ok: true, value: ls.length, detail: null };
+        }
+        const worst = over.reduce((a, b) => (asks(a) > asks(b) ? a : b));
+        return {
+            ok: false,
+            value: over.length,
+            detail: `port ${worst.port}${worst.label ? ` (${worst.label})` : ''} ` +
+                    `is configured for difficulty ` +
+                    `${fmt(asks(worst))} but network ` +
+                    `difficulty is only ${fmt(actual)}, so miners there ` +
+                    `are served ${fmt(actual)} instead. It sets no ` +
+                    `min_diff, so nothing is holding the difficulty up — ` +
+                    `rented hashrate measuring this port will read it as ` +
+                    `below its floor`,
+        };
+    }));
+
+    /* Does the block value the pool is being told make arithmetic sense?
+     *
+     * A template reports the coinbase value in one field and the per-transaction
+     * fees in another, and the proxy reads them independently — so
+     * value - fees is an independent estimate of the block subsidy, and the
+     * subsidy is not a free parameter. It is 50 BTC halved once per era, and
+     * nothing else. If that difference is not a halving value, the pool is
+     * being told a block is worth something it is not.
+     *
+     * This matters far beyond reporting. On the coinbasevalue path the proxy
+     * builds the coinbase from this number, so getting it wrong produces a
+     * consensus-invalid block the node refuses. On the coinbasetxn path (the
+     * CUSF enforcer, where the backend supplies the coinbase) the block stays
+     * valid and the error is silent — but the number still sets the PPS rate
+     * every share is credited at, so an inflated value overpays every miner by
+     * the same factor, and the pool owes real money it never earned.
+     *
+     * The two directions are both real failure modes of the same parse:
+     * value far ABOVE the subsidy means the value field is being over-read,
+     * and value at or near ZERO means it is being read as fees-only. */
+    checks.push(guard('block_value', 'Block value matches the subsidy', () => {
+        const rows = d.prepare(`
+            SELECT height, coinbase_value_sats, tx_fees_sats
+              FROM templates
+             WHERE height > 0
+             ORDER BY id DESC LIMIT 50`).all();
+        if (rows.length === 0) return { ok: true, value: null, detail: 'no templates yet' };
+        let worst = null;
+        for (const r of rows) {
+            const expected = subsidyAt(Number(r.height));
+            if (expected <= 0) continue;   /* past the last halving: nothing to check */
+            const implied = Number(r.coinbase_value_sats) - Number(r.tx_fees_sats);
+            const ratio = implied / expected;
+            /* Fees above the subsidy are possible but rare; 2x is generous.
+             * Below the subsidy is not possible at all. */
+            if (ratio >= 1 && ratio <= 2) continue;
+            if (!worst || Math.abs(Math.log(ratio || 1e-9)) > Math.abs(Math.log(worst.ratio || 1e-9))) {
+                worst = { height: Number(r.height), implied, expected, ratio };
+            }
+        }
+        if (!worst) return { ok: true, value: null, detail: null };
+        const btc = n => (n / 1e8).toFixed(4);
+        return {
+            ok: false,
+            value: Math.round(worst.ratio * 100) / 100,
+            detail: `at height ${worst.height} the template implies a ` +
+                    `${btc(worst.implied)} BTC subsidy, but the schedule says ` +
+                    `${btc(worst.expected)} BTC — every reward and the PPS rate ` +
+                    `are scaled by this`,
+        };
+    }));
+
+    /* How many of the pool's recent candidates actually made it into the
+     * chain. On the alphanet forknet this was effectively 0%, invisible
+     * because every candidate was counted as a block — the pool looked like
+     * it was winning constantly while earning nothing. A sustained high
+     * orphan rate is a real operational signal (a slow or badly-peered node,
+     * a template far behind the tip), not chain noise to be swallowed.
+     *
+     * Only settled candidates count toward the ratio: 'pending' means nothing
+     * has been able to verify it yet, which is not evidence either way. */
+    checks.push(guard('orphan_rate', 'Blocks reaching the chain', () => {
+        const r = one(d, `
+            SELECT COUNT(*) FILTER (WHERE status = 'confirmed') AS good,
+                   COUNT(*) FILTER (WHERE status IN ('orphaned','rejected')) AS lost
+              FROM (SELECT status FROM blocks_found
+                     WHERE status <> 'pending'
+                     ORDER BY ts DESC LIMIT 100)`);
+        const good = Number(r?.good || 0);
+        const lost = Number(r?.lost || 0);
+        const settled = good + lost;
+        /* Nothing settled yet is not a failure — say so rather than
+         * reporting a 0% success rate the pool has not earned. */
+        if (settled === 0) return { ok: true, value: null, detail: 'no settled candidates yet' };
+        const pct = (good / settled) * 100;
+        return {
+            ok: pct >= 50,
+            value: Math.round(pct),
+            detail: pct >= 50
+                ? null
+                : `only ${good} of the last ${settled} candidates reached the chain`,
+        };
     }));
 
     /* In-flight rows with no txid mean the worker died around a broadcast and

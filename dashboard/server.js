@@ -19,9 +19,15 @@ import { startHealthMonitor, currentHealth } from './lib/health.js';
 import { versions } from './lib/versions.js';
 import * as fmt from './lib/fmt.js';
 import { createAdminRouter } from './lib/admin-router.js';
+import { fetchSlipstream } from './lib/slipstream.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT     = parseInt(process.env.PORT || '8081', 10);
+// Loopback by default, like the payout and slipstream services: the
+// dashboard is meant to be published through nginx, and /admin speaks HTTP
+// Basic auth, which must not be reachable in the clear on a public
+// interface. Set DASHBOARD_BIND=0.0.0.0 (or ::) to serve it directly.
+const BIND     = process.env.DASHBOARD_BIND || '127.0.0.1';
 const DB_PATH  = process.env.PROXY_DB_PATH || '../data/shares.db';
 
 const app = express();
@@ -45,6 +51,18 @@ app.use((_req, res, next) => {
     Object.assign(res.locals, fmt.all);
     /* Every page renders the banner, so every render needs the snapshot. */
     res.locals.health = currentHealth();
+    /* Same reason: the pool-identity strip is in both navs. Cheap enough to
+     * read per request — one row, by primary key, off a one-row table — and
+     * reading it live means a proxy restart onto a different network shows
+     * up on the next refresh instead of on the next dashboard restart. */
+    res.locals.pool = stats.poolMeta(db);
+    /* The about-numbers card needs both to tell a miner how to connect, and
+     * it is a partial rather than an index-only block, so they live here
+     * rather than being threaded through one render call. */
+    res.locals.stratumUrl  = PUBLIC_STRATUM_URL;
+    res.locals.sidechainId = THUNDER_SIDECHAIN_ID;
+    /* The Slipstream nav link appears only on a pool that runs it. */
+    res.locals.slipstreamEnabled = !!SLIPSTREAM_API_URL;
     next();
 });
 
@@ -64,6 +82,12 @@ startHealthMonitor(db, { intervalMs: HEALTH_INTERVAL_MS });
 
 /* --- public-side config ------------------------------------------------- */
 const PUBLIC_STRATUM_URL = process.env.PUBLIC_STRATUM_URL || 'stratum+tcp://<pool-host>:3334';
+
+/* Slipstream (optional). SLIPSTREAM_API_URL is where this process reaches
+ * the service, e.g. http://127.0.0.1:8124; PUBLIC_SLIPSTREAM_URL is where
+ * submitters do. */
+const SLIPSTREAM_API_URL    = process.env.SLIPSTREAM_API_URL    || '';
+const PUBLIC_SLIPSTREAM_URL = process.env.PUBLIC_SLIPSTREAM_URL || '';
 
 /* The PPS rate is NOT configured here. It is read from pool_meta, which the
  * proxy writes on every template change, so the dashboard always reports the
@@ -143,7 +167,6 @@ app.get('/', (_req, res) => {
     const node   = stats.nodeStatus(db);
     res.render('index', {
         ov, lb, lbAddr, blocks, node,
-        stratumUrl:  PUBLIC_STRATUM_URL,
         fmtHashrate: stats.fmtHashrate,
         fmtBtc:      stats.fmtBtc,
     });
@@ -188,6 +211,18 @@ app.get('/templates', (req, res) => {
         templates: stats.templates(db, { limit }),
         fmtBtc: stats.fmtBtc,
     });
+});
+
+/* Slipstream: its fees and what has been submitted. 404 on a pool that
+ * does not run it, rather than a page explaining the absence of a feature. */
+app.get('/slipstream', async (_req, res, next) => {
+    if (!SLIPSTREAM_API_URL) return res.status(404).render('404', { what: 'page' });
+    try {
+        res.render('slipstream', {
+            slip: await fetchSlipstream(SLIPSTREAM_API_URL, { limit: 50 }),
+            submitUrl: PUBLIC_SLIPSTREAM_URL || null,
+        });
+    } catch (e) { next(e); }
 });
 
 /* --- JSON API (unchanged) ---------------------------------------------- */
@@ -251,6 +286,14 @@ app.get('/api/status', async (req, res, next) => {
             pool: {
                 mode:        meta ? meta.pool_mode : null,
                 fee_bps:     meta ? meta.fee_bps   : null,
+                /* Same four facts the header strip shows. A monitor should
+                 * not have to scrape HTML to learn that the pool it is
+                 * watching restarted onto a different network. */
+                network:          meta ? meta.network          : null,
+                network_source:   meta ? meta.network_source   : null,
+                coinbase_tag:     meta ? meta.coinbase_tag     : null,
+                operator_address: meta ? meta.operator_address : null,
+                pool_btc_address: meta ? meta.pool_btc_address : null,
                 stratum_url: PUBLIC_STRATUM_URL,
                 ...stats.overview(db),
             },
@@ -279,6 +322,6 @@ app.use('/admin',
 
 app.use((_req, res) => res.status(404).render('404', { what: 'page' }));
 
-app.listen(PORT, () => {
-    console.log(`simplepool dashboard on :${PORT} (db: ${db.path})`);
+app.listen(PORT, BIND, () => {
+    console.log(`simplepool dashboard on ${BIND}:${PORT} (db: ${db.path})`);
 });
